@@ -41,6 +41,14 @@ Parameters:
       generated in Secrets Manager (retrieve it from the secret shown in the
       stack outputs).
 
+  EnableAllowList:
+    Type: String
+    Default: 'true'
+    AllowedValues: ['true', 'false']
+    Description: >-
+      When true, only players in AllowedPlayers can join (recommended).
+      Set to false to let anyone with the server address join.
+
   GameMode:
     Type: String
     Default: survival
@@ -97,6 +105,15 @@ Parameters:
       CIDR allowed to reach the game ports. Keep 0.0.0.0/0 so the kids can play
       from anywhere; set to your home IP/32 to lock it down further.
 
+  EnableMap:
+    Type: String
+    Default: 'true'
+    AllowedValues: ['true', 'false']
+    Description: >-
+      Render the world to a browsable web map served on TCP 80 of the server
+      address (uNmINeD CLI + nginx sidecars in the same task). Only available
+      while the server is running.
+
   EnableAutoStop:
     Type: String
     Default: 'true'
@@ -121,6 +138,7 @@ Conditions:
   HasPanelPassword: !Not [!Equals [!Ref PanelPassword, '']]
   AutoStopEnabled: !Equals [!Ref EnableAutoStop, 'true']
   HasSeed: !Not [!Equals [!Ref LevelSeed, '']]
+  MapEnabled: !Equals [!Ref EnableMap, 'true']
 
 Resources:
 
@@ -217,6 +235,14 @@ Resources:
           ToPort: 19155
           CidrIp: !Ref AllowedClientCidr
           Description: Bedrock NetherNet gameplay ports
+        - !If
+          - MapEnabled
+          - IpProtocol: tcp
+            FromPort: 80
+            ToPort: 80
+            CidrIp: !Ref AllowedClientCidr
+            Description: World map web viewer (nginx sidecar)
+          - !Ref AWS::NoValue
       SecurityGroupEgress:
         - IpProtocol: -1
           CidrIp: 0.0.0.0/0
@@ -282,6 +308,20 @@ Resources:
         Path: /minecraft
         CreationInfo: {OwnerUid: '1000', OwnerGid: '1000', Permissions: '0755'}
 
+  MapAccessPoint:
+    Type: AWS::EFS::AccessPoint
+    Metadata:
+      com.aws.cloudformation.Context:
+        why: >-
+          Holds the rendered web-map tiles written by the map-render sidecar and
+          served read-only by the nginx sidecar.
+    Properties:
+      FileSystemId: !Ref WorldFileSystem
+      PosixUser: {Uid: '1000', Gid: '1000'}
+      RootDirectory:
+        Path: /map
+        CreationInfo: {OwnerUid: '1000', OwnerGid: '1000', Permissions: '0755'}
+
   # ------------------------------------------------------------- ecs + server
   McCluster:
     Type: AWS::ECS::Cluster
@@ -345,6 +385,12 @@ Resources:
             TransitEncryption: ENABLED
             AuthorizationConfig:
               AccessPointId: !Ref WorldAccessPoint
+        - Name: mapout
+          EFSVolumeConfiguration:
+            FilesystemId: !Ref WorldFileSystem
+            TransitEncryption: ENABLED
+            AuthorizationConfig:
+              AccessPointId: !Ref MapAccessPoint
       ContainerDefinitions:
         - Name: minecraft
           Image: !Ref ServerImage
@@ -367,7 +413,7 @@ Resources:
             - {Name: DIFFICULTY, Value: !Ref Difficulty}
             - {Name: MAX_PLAYERS, Value: !Sub '${MaxPlayers}'}
             - {Name: ONLINE_MODE, Value: 'true'}
-            - {Name: ALLOW_LIST, Value: 'true'}
+            - {Name: ALLOW_LIST, Value: !Ref EnableAllowList}
             - {Name: ALLOW_LIST_USERS, Value: !Ref AllowedPlayers}
             - {Name: SERVER_PORT, Value: '19132'}
             - {Name: SERVER_UDP_PORTS, Value: '<public_ipv4>:19140-19155:19140-19155'}
@@ -381,6 +427,65 @@ Resources:
               awslogs-group: !Ref ServerLogGroup
               awslogs-region: !Ref AWS::Region
               awslogs-stream-prefix: minecraft
+        - !If
+          - MapEnabled
+          - Name: map-render
+            Image: amazonlinux:2023
+            Essential: true
+            EntryPoint: ['/bin/bash', '-c']
+            Command:
+              - |
+                set -e
+                mkdir -p /data/.tools /work /map
+                if ! find /data/.tools -name unmined-cli -type f | grep -q .; then
+                  curl -fsSL "$UNMINED_URL" -o /tmp/unmined.tgz
+                  tar -xzf /tmp/unmined.tgz -C /data/.tools
+                fi
+                CLI=$(find /data/.tools -name unmined-cli -type f | head -1)
+                chmod +x "$CLI"
+                while true; do
+                  rm -rf /work/worlds && cp -a /data/worlds /work/ 2>/dev/null || true
+                  for w in /work/worlds/*/; do
+                    [ -d "$w" ] && nice -n 19 "$CLI" web render --world "$w" --output /map || true
+                  done
+                  [ -f /map/unmined.index.html ] && cp /map/unmined.index.html /map/index.html || true
+                  sleep "${MAP_INTERVAL_SECONDS:-600}"
+                done
+            MountPoints:
+              - SourceVolume: mcdata
+                ContainerPath: /data
+              - SourceVolume: mapout
+                ContainerPath: /map
+            Environment:
+              - {Name: UNMINED_URL, Value: 'https://unmined.net/download/unmined-cli-linux-x64-dev/'}
+              - {Name: MAP_INTERVAL_SECONDS, Value: '600'}
+            LogConfiguration:
+              LogDriver: awslogs
+              Options:
+                awslogs-group: !Ref ServerLogGroup
+                awslogs-region: !Ref AWS::Region
+                awslogs-stream-prefix: map-render
+          - !Ref AWS::NoValue
+        - !If
+          - MapEnabled
+          - Name: map-web
+            Image: nginx:alpine
+            Essential: true
+            PortMappings:
+              - ContainerPort: 80
+                Protocol: tcp
+                HostPort: 80
+            MountPoints:
+              - SourceVolume: mapout
+                ContainerPath: /usr/share/nginx/html
+                ReadOnly: true
+            LogConfiguration:
+              LogDriver: awslogs
+              Options:
+                awslogs-group: !Ref ServerLogGroup
+                awslogs-region: !Ref AWS::Region
+                awslogs-stream-prefix: map-web
+          - !Ref AWS::NoValue
 
   McService:
     Type: AWS::ECS::Service
@@ -498,6 +603,7 @@ Resources:
           IDLE_SHUTDOWN_MINUTES: !Ref IdleShutdownMinutes
           GAME_PORT: '19132'
           SERVER_NAME: !Ref ServerName
+          MAP_ENABLED: !Ref EnableMap
 
   # -------------------------------------------------------------- http facade
   PanelApi:

@@ -22,7 +22,9 @@ param(
   [string]$Difficulty      = 'normal',
   [int]$MaxPlayers         = 10,
   [string]$EnableAutoStop  = 'true',
-  [int]$IdleShutdownMinutes = 45
+  [int]$IdleShutdownMinutes = 45,
+  [string]$EnableAllowList = 'true',
+  [string]$EnableMap       = 'true'
 )
 
 $ErrorActionPreference = 'Stop'
@@ -71,7 +73,9 @@ $overrides = @(
   "Difficulty=$Difficulty",
   "MaxPlayers=$MaxPlayers",
   "EnableAutoStop=$EnableAutoStop",
-  "IdleShutdownMinutes=$IdleShutdownMinutes"
+  "IdleShutdownMinutes=$IdleShutdownMinutes",
+  "EnableAllowList=$EnableAllowList",
+  "EnableMap=$EnableMap"
 )
 
 Write-Host "Deploying stack $StackName to $Region ..."

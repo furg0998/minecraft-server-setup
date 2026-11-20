@@ -26,6 +26,7 @@ LOG_GROUP = os.environ["LOG_GROUP_NAME"]
 SECRET_ARN = os.environ["PANEL_SECRET_ARN"]
 IDLE_MINUTES = int(os.environ.get("IDLE_SHUTDOWN_MINUTES", "45"))
 GAME_PORT = int(os.environ.get("GAME_PORT", "19132"))
+MAP_ENABLED = os.environ.get("MAP_ENABLED", "true") == "true"
 SERVER_NAME = os.environ.get("SERVER_NAME", "Minecraft Server")
 LOG_STREAM_PREFIX = "minecraft/minecraft/"  # <awslogs-prefix>/<container>/<task-id>
 
@@ -181,6 +182,7 @@ def _status():
         "taskStatus": last_status,
         "address": ip,
         "port": GAME_PORT,
+        "mapUrl": f"http://{ip}/" if (ip and MAP_ENABLED) else None,
         "reachable": reachable,
         "players": players,
         "uptimeMinutes": uptime,
