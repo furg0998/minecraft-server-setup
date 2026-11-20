@@ -455,6 +455,7 @@ Resources:
                   - !GetAtt McCluster.Arn
                   - !Sub 'arn:aws:ecs:${AWS::Region}:${AWS::AccountId}:service/${McCluster}/*'
                   - !Sub 'arn:aws:ecs:${AWS::Region}:${AWS::AccountId}:task/${McCluster}/*'
+                  - !Sub 'arn:aws:ecs:${AWS::Region}:${AWS::AccountId}:container-instance/${McCluster}/*'
               - Sid: EniLookup
                 Effect: Allow
                 Action: ec2:DescribeNetworkInterfaces
