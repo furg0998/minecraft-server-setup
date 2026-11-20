@@ -431,11 +431,12 @@ Resources:
           - MapEnabled
           - Name: map-render
             Image: amazonlinux:2023
-            Essential: true
+            Essential: false
             EntryPoint: ['/bin/bash', '-c']
             Command:
               - |
                 set -e
+                yum install -y tar gzip curl
                 mkdir -p /data/.tools /work /map
                 if ! find /data/.tools -name unmined-cli -type f | grep -q .; then
                   curl -fsSL "$UNMINED_URL" -o /tmp/unmined.tgz
@@ -470,7 +471,7 @@ Resources:
           - MapEnabled
           - Name: map-web
             Image: nginx:alpine
-            Essential: true
+            Essential: false
             PortMappings:
               - ContainerPort: 80
                 Protocol: tcp
