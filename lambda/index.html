@@ -92,6 +92,16 @@
       <button class="copy" id="copyBtn">Copy</button>
     </div>
     <div class="muted" id="uptime"></div>
+    <div id="playRow" hidden>
+      <a id="playLink" href="#"
+         style="display:inline-block;margin-top:10px;background:#4a6fa5;color:#fff;
+                padding:10px 18px;border-radius:8px;font-weight:700;text-decoration:none;">
+        &#9654; Launch Minecraft
+      </a>
+      <div class="muted" style="font-size:.8rem;margin-top:6px">
+        Opens Minecraft straight to this server (works on Windows, Android &amp; iPad/iPhone).
+      </div>
+    </div>
     <div id="mapRow" hidden>
       <a id="mapLink" href="#" target="_blank" rel="noopener"
          style="display:inline-block;margin-top:10px;background:var(--accent);color:#fff;
@@ -118,6 +128,27 @@
       <li>The address can change each time the server starts &mdash; check this page before joining.</li>
       <li>When you're done, press <b>Stop</b> (or it stops by itself after everyone's been gone a while).</li>
     </ol>
+  </div>
+
+  <div class="card">
+    <div class="label">Need access?</div>
+    <div class="muted" style="font-size:.9rem;line-height:1.6;margin-bottom:10px">
+      Only gamertags on the allow-list can join. Ask a parent to approve you &mdash;
+      enter your <b>exact gamertag</b> below and we'll look it up automatically.
+      To check your XUID yourself, use
+      <a href="https://rghlab.co.uk/xuid/" target="_blank" rel="noopener" style="color:var(--green)">rghlab.co.uk/xuid</a>.
+    </div>
+    <div style="display:flex;gap:8px">
+      <input id="gtag" type="text" placeholder="Your gamertag" maxlength="32"
+             style="flex:1;padding:10px;border-radius:8px;border:1px solid #3a434d;
+                    background:var(--panel2);color:var(--text);font-size:1rem">
+      <button class="btn-start" id="reqBtn" style="padding:10px 18px;font-size:.9rem">Request</button>
+    </div>
+    <div id="reqMsg" style="min-height:1.2em;font-size:.85rem;color:var(--amber);margin-top:6px"></div>
+  </div>
+
+  <div id="adminRow" class="muted" style="font-size:.8rem;text-align:center" hidden>
+    <a id="adminLink" href="#" style="color:var(--muted)">Admin: approve access requests</a>
   </div>
 </main>
 
@@ -155,6 +186,11 @@ function render(s) {
   if (s.address) {
     cc.hidden = false;
     $("addr").textContent = s.address + ":" + s.port;
+    if (s.state === "ONLINE") {
+      $("playRow").hidden = false;
+      $("playLink").href = "minecraft://connect/?serverUrl=" +
+        encodeURIComponent(s.address) + "&serverPort=" + s.port;
+    } else { $("playRow").hidden = true; }
     if (s.mapUrl) { $("mapRow").hidden = false; $("mapLink").href = s.mapUrl; }
     else { $("mapRow").hidden = true; }
     $("uptime").textContent =
@@ -164,6 +200,8 @@ function render(s) {
   } else {
     cc.hidden = true;
   }
+
+  if (s.adminUrl) { $("adminRow").hidden = false; $("adminLink").href = s.adminUrl; }
 
   const ul = $("players");
   ul.innerHTML = "";
@@ -192,6 +230,23 @@ async function control(action) {
   catch (e) {}
   setTimeout(refresh, 3000);
 }
+
+$("reqBtn").onclick = async () => {
+  const tag = $("gtag").value.trim();
+  if (!tag) { $("reqMsg").textContent = "Type your gamertag first."; return; }
+  $("reqMsg").textContent = "Looking up " + tag + "\u2026";
+  try {
+    const d = await api("/api/access-request", {
+      method: "POST", body: JSON.stringify({ gamertag: tag })
+    });
+    $("reqMsg").textContent = d.alreadyAllowed
+      ? d.gamertag + " is already on the allow-list - you can join!"
+      : "Found " + d.gamertag + " (xuid " + d.xuid + ") - request sent for approval!";
+  } catch (e) {
+    if (e.message !== "unauthorized")
+      $("reqMsg").textContent = "Couldn't send the request - check the gamertag and try again.";
+  }
+};
 
 $("startBtn").onclick = () => control("start");
 $("stopBtn").onclick  = () => control("stop");

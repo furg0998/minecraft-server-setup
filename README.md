@@ -54,7 +54,8 @@ that URL and the panel password to the kids.
 
 Other `deploy.ps1` parameters: `-ServerName`, `-GameMode`, `-Difficulty`,
 `-MaxPlayers`, `-EnableAutoStop`, `-IdleShutdownMinutes`, `-EnableAllowList`,
-`-EnableMap`, `-Region`, `-StackName`.
+`-EnableMap`, `-HostedZoneId`, `-HostedZoneName`, `-DnsPrefix`,
+`-EnableAccessPortal`, `-AdminEmail`, `-Region`, `-StackName`.
 
 **Every `deploy.ps1` run must re-pass all parameters you care about** —
 anything not passed resets to its template default. To make this easy, put your
@@ -99,22 +100,74 @@ control the server.
 
 For the most reliable allow-listing use `gamertag:XUID` pairs:
 
-- Look up XUIDs at <https://www.cxkes.me/xbox/xuid>
+- Look up XUIDs at <https://rghlab.co.uk/xuid/> (the panel can also look them
+  up automatically — see "Access requests" below)
 - Or check the server logs — a player's XUID is printed on join:
   `aws logs filter-log-events --log-group-name /ecs/minecraft-bedrock`
 
-To change allowed players later, redeploy with the new `-AllowedPlayers` list
-(stack update). Then stop+start the server so the new task picks it up.
+The allow-list lives in a **Secrets Manager secret** (`player-access`, key
+`players`), injected into the container at task start. That means:
+
+- Approving a player from the admin page updates the secret directly — no
+  CloudFormation deploy needed.
+- **Adding a player restarts the server task** (~1–2 min) if it's running —
+  `allowlist.json` is written at container start and can't be hot-reloaded.
+  If the server is stopped, the change just applies on next start.
+- A `deploy.ps1` run rewrites the secret from `-AllowedPlayers`, resetting any
+  admin approvals — keep the full list in `deploy.local.json`.
 
 To disable the allow-list entirely (anyone with the IP can join), redeploy with
 `-EnableAllowList false`. Prefer keeping it on — the allow-list is the only
 per-player access control Bedrock has.
 
+## Access requests + admin approval
+
+When `EnableAccessPortal` is true (default), the panel has a **"Need access?"**
+form: a kid types their gamertag, the Lambda looks up the XUID via
+`api.rghlab.co.uk`, and stores a pending request in the `player-access` secret.
+
+You review them on the admin page — `admin.<prefix>.<zone>` with a hosted zone,
+or `<execute-api-url>/admin` without — which is protected by a **Cognito
+user pool** (invite-only, AWS-hosted login). Create your admin user at deploy:
+
+```powershell
+.\deploy.ps1 -AdminEmail "you@example.com"
+```
+
+Cognito emails a temporary password; use it to sign in at the admin URL. The
+page shows pending requests (with a warn banner if the server is running) and
+the current allow-list; **Approve** writes the player into the secret and
+restarts the task if needed. The Lambda role for this is scoped to
+`secretsmanager:PutSecretValue` on that one secret plus `ecs:UpdateService` on
+the service — it cannot touch the rest of the stack.
+
+## Custom domain + HTTPS (optional)
+
+If you own a Route53 hosted zone in the same account, set `HostedZoneId`,
+`HostedZoneName` and (optionally) `DnsPrefix` — in `deploy.local.json` or via
+`-HostedZoneId`/`-HostedZoneName`/`-DnsPrefix`. The stack then creates three
+records under `server.|panel.|map.<prefix>.<zone>` (prefix defaults to the
+stack name):
+
+| Hostname | What it does |
+|---|---|
+| `server.<prefix>.<zone>` | A record the Lambda repoints to the task's public IP on every start (via ECS state-change events; deleted on stop). Kids always connect to the same name — no more changing IP. |
+| `panel.<prefix>.<zone>` | HTTPS custom domain on the same API Gateway → the control panel. |
+| `map.<prefix>.<zone>` | HTTPS custom domain → Lambda proxies the rendered tiles from a private S3 bucket. Works **even when the server is off** (tiles persist). |
+| `admin.<prefix>.<zone>` | HTTPS custom domain → the Cognito-protected admin approval page. |
+
+An ACM certificate (free, auto-validated through the hosted zone) covers the
+panel and map domains. No Elastic IP, NLB or NAT is needed — the game needs
+direct UDP/TCP anyway, and the web services all ride the API Gateway.
+
+When no hosted zone is configured everything still works with the raw
+execute-api URL and `http://<ip>/` for the map.
+
 ## Notes / limitations
 
-- **The server IP changes every time it starts.** The panel always shows the
-  current address — kids should check it before joining. (Elastic IPs can't
-  attach to Fargate; an NLB for a static IP would cost ~$16/mo.)
+- **The server IP changes every time it starts.** With a hosted zone
+  configured, `server.<prefix>.<zone>` tracks it automatically (60s TTL).
+  Without one, the panel always shows the current IP.
 - **Ports**: TCP 19132 + UDP 19140–19155 must be reachable. Bedrock 1.26.50+
   uses NetherNet; the old UDP-only RakNet transport is being removed by Mojang.
 - **Startup takes ~1–2 minutes** (Fargate provisioning + BDS boot; first boot
@@ -138,7 +191,8 @@ per-player access control Bedrock has.
 | Fargate 1 vCPU / 2 GB task   | ~$0.049/hour, only while running            |
 | EFS (world + binaries)       | ~$0.30/GB-month (a few GB → pennies)        |
 | Lambda + API Gateway         | effectively free at this volume             |
-| Secrets Manager (1 secret)   | $0.40/month                                 |
+| Secrets Manager (2 secrets)  | $0.80/month                                 |
+| Cognito (admin logins)       | free (well under the 10k MAU free tier)     |
 | VPC / public subnets         | free (no NAT gateway)                       |
 
 A weekend of play (say 10 h/week) is roughly **$2/month**; leaving it on 24/7

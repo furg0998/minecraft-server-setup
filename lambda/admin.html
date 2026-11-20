@@ -1,0 +1,274 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Minecraft - Access Admin</title>
+<style>
+  :root {
+    --bg: #1b1f24; --panel: #262c33; --panel2: #2f3841; --text: #e8eef2;
+    --muted: #9aa7b1; --green: #57d06a; --red: #e0574f; --amber: #e8b93e;
+    --accent: #3ba55d;
+  }
+  * { box-sizing: border-box; }
+  body {
+    margin: 0; font-family: system-ui, -apple-system, "Segoe UI", sans-serif;
+    background: var(--bg); color: var(--text);
+    display: flex; flex-direction: column; align-items: center; padding: 24px 16px 48px;
+  }
+  main { width: 100%; max-width: 560px; }
+  h1 { font-size: 1.5rem; margin: 0 0 4px; }
+  .sub { color: var(--muted); font-size: .85rem; margin-bottom: 20px; }
+  .card {
+    background: var(--panel); border-radius: 10px; padding: 18px;
+    margin-bottom: 14px; box-shadow: 0 2px 8px rgba(0,0,0,.35);
+  }
+  button {
+    border: 0; border-radius: 8px; padding: 10px 20px; font-size: .95rem;
+    font-weight: 700; cursor: pointer; color: #fff; transition: filter .15s;
+  }
+  button:hover { filter: brightness(1.15); }
+  button:disabled { opacity: .45; cursor: not-allowed; }
+  .btn-ok { background: var(--accent); }
+  .btn-no { background: #b03a32; }
+  .btn-login { background: #4a6fa5; padding: 12px 26px; font-size: 1rem; }
+  .row { display: flex; justify-content: space-between; align-items: center; gap: 10px; flex-wrap: wrap; }
+  .label { color: var(--muted); font-size: .8rem; text-transform: uppercase; letter-spacing: .06em; }
+  ul.req { list-style: none; padding: 0; margin: 10px 0 0; }
+  ul.req li {
+    padding: 10px 0; border-bottom: 1px solid #3a434d;
+    display: flex; justify-content: space-between; align-items: center; gap: 10px;
+  }
+  ul.req li:last-child { border-bottom: 0; }
+  .who { font-size: 1.05rem; }
+  .xuid { color: var(--muted); font-size: .78rem; font-family: ui-monospace, Consolas, monospace; }
+  .when { color: var(--muted); font-size: .78rem; }
+  .actions button { padding: 7px 14px; font-size: .85rem; }
+  .actions button + button { margin-left: 6px; }
+  #msg { min-height: 1.2em; font-size: .85rem; color: var(--amber); margin-top: 6px; }
+  .muted { color: var(--muted); }
+  code { background: var(--panel2); padding: 1px 6px; border-radius: 4px; }
+  .warn { color: var(--amber); font-size: .8rem; margin-top: 8px; }
+  .topbar { display: flex; justify-content: space-between; align-items: center; }
+  .logout { background: var(--panel2); color: var(--text); padding: 7px 14px; font-size: .8rem; }
+</style>
+</head>
+<body>
+<main>
+  <div class="topbar">
+    <h1>&#128737; Access Admin</h1>
+    <button class="logout" id="logoutBtn" hidden>Sign out</button>
+  </div>
+  <div class="sub">Approve players onto the Minecraft allow-list</div>
+
+  <div class="card" id="loginCard">
+    <p class="muted">Sign in with the admin account to review access requests.</p>
+    <button class="btn-login" id="loginBtn">Sign in</button>
+    <div id="loginMsg"></div>
+  </div>
+
+  <div class="card" id="pendingCard" hidden>
+    <div class="label">Pending requests</div>
+    <ul class="req" id="requests"><li class="muted">Loading&hellip;</li></ul>
+    <div class="warn" id="restartWarn" hidden>
+      &#9888; The server is currently running &mdash; approving will briefly restart it (~1&ndash;2 min) so the new player is picked up.
+    </div>
+    <div id="msg"></div>
+  </div>
+
+  <div class="card" id="allowedCard" hidden>
+    <div class="label">Current allow-list</div>
+    <ul class="req" id="players"><li class="muted">Loading&hellip;</li></ul>
+    <div class="muted" style="font-size:.8rem;margin-top:8px">
+      To remove a player, edit the <code>AllowedPlayers</code> value in
+      <code>deploy.local.json</code> and redeploy, or update the
+      <code>player-access</code> secret in Secrets Manager.
+    </div>
+  </div>
+</main>
+
+<script>
+const COGNITO_DOMAIN = "__COGNITO_DOMAIN__";
+const CLIENT_ID = "__COGNITO_CLIENT_ID__";
+const REDIRECT_URI = "__ADMIN_URL__";
+const $ = id => document.getElementById(id);
+
+// ---------- PKCE helpers ----------
+function b64url(buf) {
+  return btoa(String.fromCharCode(...new Uint8Array(buf)))
+    .replace(/\+/g, "-").replace(/\//g, "_").replace(/=+$/, "");
+}
+async function pkcePair() {
+  const verifier = b64url(crypto.getRandomValues(new Uint8Array(48)));
+  const digest = await crypto.subtle.digest("SHA-256", new TextEncoder().encode(verifier));
+  return { verifier, challenge: b64url(digest) };
+}
+
+// ---------- auth ----------
+function token() { return sessionStorage.getItem("admToken") || ""; }
+
+async function login() {
+  const { verifier, challenge } = await pkcePair();
+  sessionStorage.setItem("admVerifier", verifier);
+  const url = COGNITO_DOMAIN + "/oauth2/authorize?" + new URLSearchParams({
+    response_type: "code", client_id: CLIENT_ID, redirect_uri: REDIRECT_URI,
+    scope: "openid email profile",
+    code_challenge: challenge, code_challenge_method: "S256",
+  });
+  location.href = url;
+}
+
+async function exchangeCode(code) {
+  const res = await fetch(COGNITO_DOMAIN + "/oauth2/token", {
+    method: "POST",
+    headers: { "content-type": "application/x-www-form-urlencoded" },
+    body: new URLSearchParams({
+      grant_type: "authorization_code", client_id: CLIENT_ID,
+      redirect_uri: REDIRECT_URI, code,
+      code_verifier: sessionStorage.getItem("admVerifier") || "",
+    }),
+  });
+  if (!res.ok) throw new Error("token exchange failed: " + res.status);
+  const t = await res.json();
+  sessionStorage.setItem("admToken", t.access_token);
+}
+
+// ---------- api ----------
+async function api(path, opts = {}) {
+  const res = await fetch(path, {
+    ...opts,
+    headers: { authorization: "Bearer " + token(), "content-type": "application/json" },
+  });
+  if (res.status === 401) {
+    sessionStorage.removeItem("admToken");
+    showLogin();
+    throw new Error("unauthorized");
+  }
+  return res.json();
+}
+
+// ---------- ui ----------
+function showLogin() {
+  $("loginCard").hidden = false;
+  $("pendingCard").hidden = true;
+  $("allowedCard").hidden = true;
+  $("logoutBtn").hidden = true;
+}
+function showApp() {
+  $("loginCard").hidden = true;
+  $("pendingCard").hidden = false;
+  $("allowedCard").hidden = false;
+  $("logoutBtn").hidden = false;
+}
+
+function render(d) {
+  const req = $("requests");
+  req.innerHTML = "";
+  if (d.requests && d.requests.length) {
+    for (const r of d.requests) {
+      const li = document.createElement("li");
+      const info = document.createElement("span");
+      const when = r.ts ? new Date(r.ts * 1000).toLocaleString() : "";
+      info.innerHTML = "";
+      const who = document.createElement("div");
+      who.className = "who"; who.textContent = r.gamertag;
+      const meta = document.createElement("div");
+      meta.className = "xuid"; meta.textContent = "xuid " + r.xuid + (when ? " · " + when : "");
+      info.appendChild(who); info.appendChild(meta);
+      const act = document.createElement("span");
+      act.className = "actions";
+      const ok = document.createElement("button");
+      ok.className = "btn-ok"; ok.textContent = "Approve";
+      ok.onclick = () => approve(r);
+      const no = document.createElement("button");
+      no.className = "btn-no"; no.textContent = "Reject";
+      no.onclick = () => reject(r);
+      act.appendChild(ok); act.appendChild(no);
+      li.appendChild(info); li.appendChild(act);
+      req.appendChild(li);
+    }
+  } else {
+    const li = document.createElement("li");
+    li.className = "muted"; li.textContent = "No pending requests";
+    req.appendChild(li);
+  }
+  const pl = $("players");
+  pl.innerHTML = "";
+  if (d.players && d.players.length) {
+    for (const p of d.players) {
+      const li = document.createElement("li");
+      const span = document.createElement("span");
+      const parts = p.split(":");
+      const who = document.createElement("div");
+      who.className = "who"; who.textContent = parts[0];
+      const meta = document.createElement("div");
+      meta.className = "xuid"; meta.textContent = parts[1] ? "xuid " + parts[1] : "";
+      span.appendChild(who); span.appendChild(meta);
+      li.appendChild(span);
+      pl.appendChild(li);
+    }
+  } else {
+    const li = document.createElement("li");
+    li.className = "muted"; li.textContent = "Allow-list is empty";
+    pl.appendChild(li);
+  }
+  $("restartWarn").hidden = !d.serverRunning;
+}
+
+async function refresh() {
+  try {
+    const d = await api("/api/admin/requests");
+    render(d);
+  } catch (e) {
+    if (e.message !== "unauthorized") $("msg").textContent = "Can't reach the admin API.";
+  }
+}
+
+async function approve(r) {
+  $("msg").textContent = "Approving " + r.gamertag + "\u2026";
+  try {
+    const d = await api("/api/admin/approve", {
+      method: "POST",
+      body: JSON.stringify({ gamertag: r.gamertag, xuid: r.xuid }),
+    });
+    $("msg").textContent = d.restarting
+      ? r.gamertag + " approved - server restarting (~1-2 min) to pick them up."
+      : r.gamertag + " approved - they'll be able to join on next start.";
+  } catch (e) {
+    $("msg").textContent = "Approve failed.";
+  }
+  refresh();
+}
+
+async function reject(r) {
+  $("msg").textContent = "Rejecting " + r.gamertag + "\u2026";
+  try {
+    await api("/api/admin/reject", {
+      method: "POST", body: JSON.stringify({ xuid: r.xuid }),
+    });
+    $("msg").textContent = r.gamertag + " rejected.";
+  } catch (e) {
+    $("msg").textContent = "Reject failed.";
+  }
+  refresh();
+}
+
+// shown from the API response in render() - warn only if the server is up
+
+
+$("loginBtn").onclick = login;
+$("logoutBtn").onclick = () => { sessionStorage.removeItem("admToken"); showLogin(); };
+
+(async () => {
+  const code = new URLSearchParams(location.search).get("code");
+  if (code) {
+    history.replaceState({}, "", location.pathname);
+    try { await exchangeCode(code); }
+    catch (e) { $("loginMsg").textContent = "Sign-in failed - " + e.message; showLogin(); return; }
+  }
+  if (token()) { showApp(); refresh(); }
+  else showLogin();
+})();
+</script>
+</body>
+</html>

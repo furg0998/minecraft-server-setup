@@ -24,7 +24,12 @@ param(
   [string]$EnableAutoStop  = 'true',
   [int]$IdleShutdownMinutes = 45,
   [string]$EnableAllowList = 'true',
-  [string]$EnableMap       = 'true'
+  [string]$EnableMap       = 'true',
+  [string]$HostedZoneId    = '',
+  [string]$HostedZoneName  = '',
+  [string]$DnsPrefix       = '',
+  [string]$EnableAccessPortal = 'true',
+  [string]$AdminEmail      = ''
 )
 
 $ErrorActionPreference = 'Stop'
@@ -89,7 +94,11 @@ $overrides = @(
   "EnableAutoStop=$EnableAutoStop",
   "IdleShutdownMinutes=$IdleShutdownMinutes",
   "EnableAllowList=$EnableAllowList",
-  "EnableMap=$EnableMap"
+  "EnableMap=$EnableMap",
+  "HostedZoneId=$HostedZoneId",
+  "HostedZoneName=$HostedZoneName",
+  "DnsPrefix=$DnsPrefix",
+  "EnableAccessPortal=$EnableAccessPortal"
 )
 
 Write-Host "Deploying stack $StackName to $Region ..."
@@ -108,6 +117,27 @@ aws cloudformation describe-stacks --stack-name $StackName --region $Region `
 Write-Host "`nControl panel URL:"
 aws cloudformation describe-stacks --stack-name $StackName --region $Region `
   --query "Stacks[0].Outputs[?OutputKey=='PanelUrl'].OutputValue" --output text
+
+# Create the Cognito admin user for the access-approval page, if requested.
+if ($AdminEmail -and $EnableAccessPortal -eq 'true') {
+  $poolId = aws cloudformation describe-stacks --stack-name $StackName --region $Region `
+    --query "Stacks[0].Outputs[?OutputKey=='AdminUserPoolId'].OutputValue" --output text
+  if ($poolId -and $poolId -ne 'None') {
+    $adminUrl = aws cloudformation describe-stacks --stack-name $StackName --region $Region `
+      --query "Stacks[0].Outputs[?OutputKey=='AdminUrl'].OutputValue" --output text
+    Write-Host "`nCreating Cognito admin user $AdminEmail ..."
+    aws cognito-idp admin-create-user --user-pool-id $poolId --username $AdminEmail `
+      --user-attributes Name=email,Value=$AdminEmail Name=email_verified,Value=true `
+      --desired-delivery-mediums EMAIL --region $Region --output none 2>$null
+    if ($LASTEXITCODE -eq 0) {
+      Write-Host "Invite sent to $AdminEmail - check email for the temporary password."
+    } else {
+      Write-Host "Admin user already exists or could not be created - sign in at $adminUrl"
+      Write-Host "or reset with: aws cognito-idp admin-reset-user-password --user-pool-id $poolId --username $AdminEmail --region $Region"
+    }
+    Write-Host "Admin page: $adminUrl"
+  }
+}
 
 if (-not $PanelPassword) {
   Write-Host "`nNo -PanelPassword was given; a random one was generated. Retrieve it with:"

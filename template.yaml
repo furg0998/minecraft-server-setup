@@ -24,12 +24,18 @@ Parameters:
   AllowedPlayers:
     Type: String
     Default: ''
+    AllowedPattern: '^[^"\\]*$'
+    ConstraintDescription: >-
+      Cannot contain double-quote or backslash characters (the value is stored
+      inside a JSON secret).
     Description: >-
       Comma-separated players allowed to join the world (Bedrock allow-list).
       Best format is gamertag:XUID, e.g. "Steve:2533274790567123,Alex:2535412345678901".
       Plain gamertags also work but are less reliable. If empty, the allow-list
       stays enabled and NOBODY can join until you add players. Look up XUIDs at
-      https://www.cxkes.me/xbox/xuid or read them from the server logs.
+      https://rghlab.co.uk/xuid/ or read them from the server logs. Stored in
+      Secrets Manager so admin approvals can update it without a stack deploy;
+      note a redeploy resets it back to this parameter value.
 
   PanelPassword:
     Type: String
@@ -105,6 +111,27 @@ Parameters:
       CIDR allowed to reach the game ports. Keep 0.0.0.0/0 so the kids can play
       from anywhere; set to your home IP/32 to lock it down further.
 
+  HostedZoneId:
+    Type: String
+    Default: ''
+    Description: >-
+      Optional: Route53 hosted zone ID (e.g. Z2GKA5VKBXI24T). When set together
+      with HostedZoneName, the stack creates server./panel./map.<prefix>.<zone>
+      DNS records plus HTTPS certs - the game gets a stable hostname and the
+      panel and map are served over HTTPS via API Gateway custom domains.
+
+  HostedZoneName:
+    Type: String
+    Default: ''
+    Description: 'Optional: hosted zone domain, e.g. farcestudios.com'
+
+  DnsPrefix:
+    Type: String
+    Default: ''
+    Description: >-
+      Optional: middle label for the subdomains (server./panel./map.<prefix>.<zone>).
+      Defaults to the stack name when blank.
+
   EnableMap:
     Type: String
     Default: 'true'
@@ -134,11 +161,32 @@ Parameters:
     MaxValue: 60
     Description: How often (minutes) the auto-stop check runs.
 
+  EnableAccessPortal:
+    Type: String
+    Default: 'true'
+    AllowedValues: ['true', 'false']
+    Description: >-
+      Enables the access-request flow: kids can submit their gamertag on the
+      panel (XUID looked up automatically via api.rghlab.co.uk), and an admin
+      page at admin.<prefix>.<zone> (or <api-url>/admin) protected by a Cognito
+      login lets the parent approve them onto the allow-list.
+
 Conditions:
   HasPanelPassword: !Not [!Equals [!Ref PanelPassword, '']]
   AutoStopEnabled: !Equals [!Ref EnableAutoStop, 'true']
   HasSeed: !Not [!Equals [!Ref LevelSeed, '']]
   MapEnabled: !Equals [!Ref EnableMap, 'true']
+  HasDnsPrefix: !Not [!Equals [!Ref DnsPrefix, '']]
+  HasHostedZone: !And
+    - !Not [!Equals [!Ref HostedZoneId, '']]
+    - !Not [!Equals [!Ref HostedZoneName, '']]
+  MapDomainEnabled: !And
+    - !Condition MapEnabled
+    - !Condition HasHostedZone
+  AccessEnabled: !Equals [!Ref EnableAccessPortal, 'true']
+  AdminDomainEnabled: !And
+    - !Condition AccessEnabled
+    - !Condition HasHostedZone
 
 Resources:
 
@@ -322,6 +370,25 @@ Resources:
         Path: /map
         CreationInfo: {OwnerUid: '1000', OwnerGid: '1000', Permissions: '0755'}
 
+  MapTilesBucket:
+    Type: AWS::S3::Bucket
+    Condition: MapDomainEnabled
+    Metadata:
+      com.aws.cloudformation.Context:
+        why: >-
+          Copy of the rendered map tiles so the map.* custom domain can serve
+          them through API Gateway + Lambda over HTTPS, including while the
+          server is stopped. Derived data - safe to delete with the stack.
+    Properties:
+      PublicAccessBlockConfiguration:
+        BlockPublicAcls: true
+        BlockPublicPolicy: true
+        IgnorePublicAcls: true
+        RestrictPublicBuckets: true
+      BucketEncryption:
+        ServerSideEncryptionConfiguration:
+          - ServerSideEncryptionByDefault: {SSEAlgorithm: AES256}
+
   # ------------------------------------------------------------- ecs + server
   McCluster:
     Type: AWS::ECS::Cluster
@@ -356,6 +423,22 @@ Resources:
           - Effect: Allow
             Principal: {Service: ecs-tasks.amazonaws.com}
             Action: sts:AssumeRole
+      Policies:
+        - !If
+          - MapDomainEnabled
+          - PolicyName: map-tiles-sync
+            PolicyDocument:
+              Statement:
+                - Effect: Allow
+                  Action:
+                    - s3:PutObject
+                    - s3:DeleteObject
+                    - s3:GetObject
+                  Resource: !Sub '${MapTilesBucket.Arn}/*'
+                - Effect: Allow
+                  Action: s3:ListBucket
+                  Resource: !GetAtt MapTilesBucket.Arn
+          - !Ref AWS::NoValue
 
   ServerTaskDefinition:
     Type: AWS::ECS::TaskDefinition
@@ -414,13 +497,15 @@ Resources:
             - {Name: MAX_PLAYERS, Value: !Sub '${MaxPlayers}'}
             - {Name: ONLINE_MODE, Value: 'true'}
             - {Name: ALLOW_LIST, Value: !Ref EnableAllowList}
-            - {Name: ALLOW_LIST_USERS, Value: !Ref AllowedPlayers}
             - {Name: SERVER_PORT, Value: '19132'}
             - {Name: SERVER_UDP_PORTS, Value: '<public_ipv4>:19140-19155:19140-19155'}
             - !If
               - HasSeed
               - {Name: SEED, Value: !Ref LevelSeed}
               - !Ref AWS::NoValue
+          Secrets:
+            - Name: ALLOW_LIST_USERS
+              ValueFrom: !Sub '${PlayerAccessSecret}:players::'
           LogConfiguration:
             LogDriver: awslogs
             Options:
@@ -436,11 +521,13 @@ Resources:
             Command:
               - |
                 set -e
-                yum install -y tar gzip curl
+                yum install -y tar gzip findutils
+                command -v curl >/dev/null || yum install -y curl || true
+                command -v aws >/dev/null || yum install -y aws-cli || true
                 mkdir -p /data/.tools /work /map
                 if ! find /data/.tools -name unmined-cli -type f | grep -q .; then
                   curl -fsSL "$UNMINED_URL" -o /tmp/unmined.tgz
-                  tar -xzf /tmp/unmined.tgz -C /data/.tools
+                  tar --no-same-owner -xzf /tmp/unmined.tgz -C /data/.tools
                 fi
                 CLI=$(find /data/.tools -name unmined-cli -type f | head -1)
                 chmod +x "$CLI"
@@ -450,6 +537,9 @@ Resources:
                     [ -d "$w" ] && nice -n 19 "$CLI" web render --world "$w" --output /map || true
                   done
                   [ -f /map/unmined.index.html ] && cp /map/unmined.index.html /map/index.html || true
+                  if [ -n "$MAP_S3_BUCKET" ]; then
+                    aws s3 sync /map "s3://$MAP_S3_BUCKET" --delete --quiet || true
+                  fi
                   sleep "${MAP_INTERVAL_SECONDS:-600}"
                 done
             MountPoints:
@@ -460,6 +550,7 @@ Resources:
             Environment:
               - {Name: UNMINED_URL, Value: 'https://unmined.net/download/unmined-cli-linux-x64-dev/'}
               - {Name: MAP_INTERVAL_SECONDS, Value: '600'}
+              - {Name: MAP_S3_BUCKET, Value: !If [MapDomainEnabled, !Ref MapTilesBucket, '']}
             LogConfiguration:
               LogDriver: awslogs
               Options:
@@ -535,6 +626,74 @@ Resources:
           PasswordLength: 20
           ExcludePunctuation: true
 
+  PlayerAccessSecret:
+    Type: AWS::SecretsManager::Secret
+    Metadata:
+      com.aws.cloudformation.Context:
+        why: >-
+          The allow-list lives here (JSON key "players") instead of a plain task
+          env var so the admin approval flow can update it with a narrowly scoped
+          secretsmanager:PutSecretValue + ecs:UpdateService - no CloudFormation
+          update needed to add a player. "requests" holds pending access asks.
+          A stack deploy rewrites this secret from the AllowedPlayers parameter,
+          which resets approved players/requests back to the parameter value.
+    Properties:
+      Description: !Sub '${AWS::StackName} allow-list + pending access requests'
+      SecretString: !Sub '{"players": "${AllowedPlayers}", "requests": []}'
+
+  # ------------------------------------------------------------- cognito admin
+  McUserPool:
+    Type: AWS::Cognito::UserPool
+    Condition: AccessEnabled
+    Metadata:
+      com.aws.cloudformation.Context:
+        why: >-
+          Invite-only pool for the admin approval page. Users are created via
+          `aws cognito-idp admin-create-user` (deploy.ps1 -AdminEmail does this);
+          public self-signup is disabled.
+    Properties:
+      UserPoolName: !Sub '${AWS::StackName}-admins'
+      AdminCreateUserConfig:
+        AllowAdminCreateUserOnly: true
+      AutoVerifiedAttributes: [email]
+      Schema:
+        - Name: email
+          AttributeDataType: String
+          Required: true
+          Mutable: true
+
+  McUserPoolDomain:
+    Type: AWS::Cognito::UserPoolDomain
+    Condition: AccessEnabled
+    Properties:
+      UserPoolId: !Ref McUserPool
+      Domain: !Sub
+        - '${P}-admin-${AWS::AccountId}'
+        - P: !If [HasDnsPrefix, !Ref DnsPrefix, !Ref AWS::StackName]
+
+  McUserPoolClient:
+    Type: AWS::Cognito::UserPoolClient
+    Condition: AccessEnabled
+    Properties:
+      UserPoolId: !Ref McUserPool
+      ClientName: admin-spa
+      GenerateSecret: false
+      AllowedOAuthFlowsUserPoolClient: true
+      AllowedOAuthFlows: [code]
+      AllowedOAuthScopes: [openid, email, profile]
+      SupportedIdentityProviders: [COGNITO]
+      CallbackURLs:
+        - !If
+          - AdminDomainEnabled
+          - !Sub
+            - 'https://admin.${P}.${Z}/'
+            - P: !If [HasDnsPrefix, !Ref DnsPrefix, !Ref AWS::StackName]
+              Z: !Ref HostedZoneName
+          - !Sub 'https://${PanelApi}.execute-api.${AWS::Region}.amazonaws.com/admin'
+      ExplicitAuthFlows:
+        - ALLOW_USER_SRP_AUTH
+        - ALLOW_REFRESH_TOKEN_AUTH
+
   # ----------------------------------------------------------- control lambda
   ControlLambdaRole:
     Type: AWS::IAM::Role
@@ -578,6 +737,46 @@ Resources:
                 Effect: Allow
                 Action: secretsmanager:GetSecretValue
                 Resource: !Ref PanelSecret
+              - Sid: ManageAllowList
+                Effect: Allow
+                Action:
+                  - secretsmanager:GetSecretValue
+                  - secretsmanager:PutSecretValue
+                Resource: !Ref PlayerAccessSecret
+        - !If
+          - HasHostedZone
+          - PolicyName: dns-sync
+            PolicyDocument:
+              Statement:
+                - Sid: UpdateServerRecord
+                  Effect: Allow
+                  Action: route53:ChangeResourceRecordSets
+                  Resource: !Sub 'arn:aws:route53:::hostedzone/${HostedZoneId}'
+          - !Ref AWS::NoValue
+        - !If
+          - AccessEnabled
+          - PolicyName: admin-auth
+            PolicyDocument:
+              Statement:
+                - Sid: ValidateAdminToken
+                  Effect: Allow
+                  Action: cognito-idp:GetUser
+                  Resource: '*'
+          - !Ref AWS::NoValue
+        - !If
+          - MapDomainEnabled
+          - PolicyName: map-tiles-read
+            PolicyDocument:
+              Statement:
+                - Sid: ServeMapTiles
+                  Effect: Allow
+                  Action: s3:GetObject
+                  Resource: !Sub '${MapTilesBucket.Arn}/*'
+                - Sid: ListMapTiles
+                  Effect: Allow
+                  Action: s3:ListBucket
+                  Resource: !GetAtt MapTilesBucket.Arn
+          - !Ref AWS::NoValue
 
   ControlLambda:
     Type: AWS::Lambda::Function
@@ -605,6 +804,47 @@ Resources:
           GAME_PORT: '19132'
           SERVER_NAME: !Ref ServerName
           MAP_ENABLED: !Ref EnableMap
+          SERVER_FQDN: !If
+            - HasHostedZone
+            - !Sub
+              - 'server.${P}.${Z}'
+              - P: !If [HasDnsPrefix, !Ref DnsPrefix, !Ref AWS::StackName]
+                Z: !Ref HostedZoneName
+            - ''
+          MAP_FQDN: !If
+            - MapDomainEnabled
+            - !Sub
+              - 'map.${P}.${Z}'
+              - P: !If [HasDnsPrefix, !Ref DnsPrefix, !Ref AWS::StackName]
+                Z: !Ref HostedZoneName
+            - ''
+          HOSTED_ZONE_ID: !If [HasHostedZone, !Ref HostedZoneId, '']
+          MAP_TILES_BUCKET: !If [MapDomainEnabled, !Ref MapTilesBucket, '']
+          ACCESS_ENABLED: !Ref EnableAccessPortal
+          PLAYER_ACCESS_ARN: !Ref PlayerAccessSecret
+          XUID_API_URL: 'https://api.rghlab.co.uk/xuid'
+          COGNITO_DOMAIN: !If
+            - AccessEnabled
+            - !Sub 'https://${McUserPoolDomain}.auth.${AWS::Region}.amazoncognito.com'
+            - ''
+          COGNITO_CLIENT_ID: !If [AccessEnabled, !Ref McUserPoolClient, '']
+          ADMIN_FQDN: !If
+            - AdminDomainEnabled
+            - !Sub
+              - 'admin.${P}.${Z}'
+              - P: !If [HasDnsPrefix, !Ref DnsPrefix, !Ref AWS::StackName]
+                Z: !Ref HostedZoneName
+            - ''
+          ADMIN_URL: !If
+            - AdminDomainEnabled
+            - !Sub
+              - 'https://admin.${P}.${Z}/'
+              - P: !If [HasDnsPrefix, !Ref DnsPrefix, !Ref AWS::StackName]
+                Z: !Ref HostedZoneName
+            - !If
+              - AccessEnabled
+              - !Sub 'https://${PanelApi}.execute-api.${AWS::Region}.amazonaws.com/admin'
+              - ''
 
   # -------------------------------------------------------------- http facade
   PanelApi:
@@ -665,12 +905,237 @@ Resources:
       Principal: events.amazonaws.com
       SourceArn: !GetAtt AutoStopRule.Arn
 
+  # ------------------------------------------------- custom domain (optional)
+  PanelAndMapCert:
+    Type: AWS::CertificateManager::Certificate
+    Condition: HasHostedZone
+    Properties:
+      DomainName: !Sub
+        - 'panel.${P}.${Z}'
+        - P: !If [HasDnsPrefix, !Ref DnsPrefix, !Ref AWS::StackName]
+          Z: !Ref HostedZoneName
+      SubjectAlternativeNames:
+        - !Sub
+          - 'map.${P}.${Z}'
+          - P: !If [HasDnsPrefix, !Ref DnsPrefix, !Ref AWS::StackName]
+            Z: !Ref HostedZoneName
+        - !If
+          - AdminDomainEnabled
+          - !Sub
+            - 'admin.${P}.${Z}'
+            - P: !If [HasDnsPrefix, !Ref DnsPrefix, !Ref AWS::StackName]
+              Z: !Ref HostedZoneName
+          - !Ref AWS::NoValue
+      ValidationMethod: DNS
+      DomainValidationOptions:
+        - DomainName: !Sub
+            - 'panel.${P}.${Z}'
+            - P: !If [HasDnsPrefix, !Ref DnsPrefix, !Ref AWS::StackName]
+              Z: !Ref HostedZoneName
+          HostedZoneId: !Ref HostedZoneId
+        - DomainName: !Sub
+            - 'map.${P}.${Z}'
+            - P: !If [HasDnsPrefix, !Ref DnsPrefix, !Ref AWS::StackName]
+              Z: !Ref HostedZoneName
+          HostedZoneId: !Ref HostedZoneId
+
+  PanelDomain:
+    Type: AWS::ApiGatewayV2::DomainName
+    Condition: HasHostedZone
+    Properties:
+      DomainName: !Sub
+        - 'panel.${P}.${Z}'
+        - P: !If [HasDnsPrefix, !Ref DnsPrefix, !Ref AWS::StackName]
+          Z: !Ref HostedZoneName
+      DomainNameConfigurations:
+        - EndpointType: REGIONAL
+          CertificateArn: !Ref PanelAndMapCert
+
+  MapDomain:
+    Type: AWS::ApiGatewayV2::DomainName
+    Condition: HasHostedZone
+    Properties:
+      DomainName: !Sub
+        - 'map.${P}.${Z}'
+        - P: !If [HasDnsPrefix, !Ref DnsPrefix, !Ref AWS::StackName]
+          Z: !Ref HostedZoneName
+      DomainNameConfigurations:
+        - EndpointType: REGIONAL
+          CertificateArn: !Ref PanelAndMapCert
+
+  PanelApiMapping:
+    Type: AWS::ApiGatewayV2::ApiMapping
+    Condition: HasHostedZone
+    Properties:
+      ApiId: !Ref PanelApi
+      DomainName: !Ref PanelDomain
+      Stage: !Ref ApiDefaultStage
+
+  MapApiMapping:
+    Type: AWS::ApiGatewayV2::ApiMapping
+    Condition: HasHostedZone
+    Properties:
+      ApiId: !Ref PanelApi
+      DomainName: !Ref MapDomain
+      Stage: !Ref ApiDefaultStage
+
+  PanelDnsRecord:
+    Type: AWS::Route53::RecordSet
+    Condition: HasHostedZone
+    Properties:
+      HostedZoneId: !Ref HostedZoneId
+      Name: !Sub
+        - 'panel.${P}.${Z}'
+        - P: !If [HasDnsPrefix, !Ref DnsPrefix, !Ref AWS::StackName]
+          Z: !Ref HostedZoneName
+      Type: A
+      AliasTarget:
+        DNSName: !GetAtt PanelDomain.RegionalDomainName
+        HostedZoneId: !GetAtt PanelDomain.RegionalHostedZoneId
+
+  MapDnsRecord:
+    Type: AWS::Route53::RecordSet
+    Condition: HasHostedZone
+    Properties:
+      HostedZoneId: !Ref HostedZoneId
+      Name: !Sub
+        - 'map.${P}.${Z}'
+        - P: !If [HasDnsPrefix, !Ref DnsPrefix, !Ref AWS::StackName]
+          Z: !Ref HostedZoneName
+      Type: A
+      AliasTarget:
+        DNSName: !GetAtt MapDomain.RegionalDomainName
+        HostedZoneId: !GetAtt MapDomain.RegionalHostedZoneId
+
+  AdminDomain:
+    Type: AWS::ApiGatewayV2::DomainName
+    Condition: AdminDomainEnabled
+    Properties:
+      DomainName: !Sub
+        - 'admin.${P}.${Z}'
+        - P: !If [HasDnsPrefix, !Ref DnsPrefix, !Ref AWS::StackName]
+          Z: !Ref HostedZoneName
+      DomainNameConfigurations:
+        - EndpointType: REGIONAL
+          CertificateArn: !Ref PanelAndMapCert
+
+  AdminApiMapping:
+    Type: AWS::ApiGatewayV2::ApiMapping
+    Condition: AdminDomainEnabled
+    Properties:
+      ApiId: !Ref PanelApi
+      DomainName: !Ref AdminDomain
+      Stage: !Ref ApiDefaultStage
+
+  AdminDnsRecord:
+    Type: AWS::Route53::RecordSet
+    Condition: AdminDomainEnabled
+    Properties:
+      HostedZoneId: !Ref HostedZoneId
+      Name: !Sub
+        - 'admin.${P}.${Z}'
+        - P: !If [HasDnsPrefix, !Ref DnsPrefix, !Ref AWS::StackName]
+          Z: !Ref HostedZoneName
+      Type: A
+      AliasTarget:
+        DNSName: !GetAtt AdminDomain.RegionalDomainName
+        HostedZoneId: !GetAtt AdminDomain.RegionalHostedZoneId
+
+  ServerDnsRecord:
+    Type: AWS::Route53::RecordSet
+    Condition: HasHostedZone
+    Metadata:
+      com.aws.cloudformation.Context:
+        why: >-
+          Placeholder A record the control Lambda UPSERTs to the task's public
+          IP whenever a task reaches RUNNING, and DELETEs when it stops - this
+          is what replaces an Elastic IP/NLB.
+    Properties:
+      HostedZoneId: !Ref HostedZoneId
+      Name: !Sub
+        - 'server.${P}.${Z}'
+        - P: !If [HasDnsPrefix, !Ref DnsPrefix, !Ref AWS::StackName]
+          Z: !Ref HostedZoneName
+      Type: A
+      TTL: '60'
+      ResourceRecords: ['127.0.0.1']
+
+  EcsStateRule:
+    Type: AWS::Events::Rule
+    Condition: HasHostedZone
+    Properties:
+      Description: Sync server.* DNS record to the task public IP
+      EventPattern:
+        source: ['aws.ecs']
+        detail-type: ['ECS Task State Change']
+        detail:
+          clusterArn: [!GetAtt McCluster.Arn]
+      State: ENABLED
+      Targets:
+        - Arn: !GetAtt ControlLambda.Arn
+          Id: dns-sync
+
+  EcsStateInvokePermission:
+    Type: AWS::Lambda::Permission
+    Condition: HasHostedZone
+    Properties:
+      FunctionName: !Ref ControlLambda
+      Action: lambda:InvokeFunction
+      Principal: events.amazonaws.com
+      SourceArn: !GetAtt EcsStateRule.Arn
+
 Outputs:
   PanelUrl:
     Description: >-
       Control panel URL - bookmark this. Start/stop the server and see who is
       playing here.
     Value: !Sub 'https://${PanelApi}.execute-api.${AWS::Region}.amazonaws.com'
+
+  PanelCustomUrl:
+    Condition: HasHostedZone
+    Description: HTTPS control panel URL on your domain.
+    Value: !Sub
+      - 'https://panel.${P}.${Z}'
+      - P: !If [HasDnsPrefix, !Ref DnsPrefix, !Ref AWS::StackName]
+        Z: !Ref HostedZoneName
+
+  MapUrl:
+    Condition: MapDomainEnabled
+    Description: HTTPS world map URL on your domain (works even when the server is off).
+    Value: !Sub
+      - 'https://map.${P}.${Z}'
+      - P: !If [HasDnsPrefix, !Ref DnsPrefix, !Ref AWS::StackName]
+        Z: !Ref HostedZoneName
+
+  ServerDnsName:
+    Condition: HasHostedZone
+    Description: >-
+      Stable hostname for Minecraft clients - points at the task's current IP
+      (updated automatically on each start). Port 19132.
+    Value: !Sub
+      - 'server.${P}.${Z}'
+      - P: !If [HasDnsPrefix, !Ref DnsPrefix, !Ref AWS::StackName]
+        Z: !Ref HostedZoneName
+
+  AdminUrl:
+    Condition: AccessEnabled
+    Description: >-
+      Admin approval page - Cognito login required. Approve/reject player
+      access requests here. Create your admin user with
+      deploy.ps1 -AdminEmail or: aws cognito-idp admin-create-user
+      --user-pool-id <UserPoolId output> --username <you@email>
+    Value: !If
+      - AdminDomainEnabled
+      - !Sub
+        - 'https://admin.${P}.${Z}/'
+        - P: !If [HasDnsPrefix, !Ref DnsPrefix, !Ref AWS::StackName]
+          Z: !Ref HostedZoneName
+      - !Sub 'https://${PanelApi}.execute-api.${AWS::Region}.amazonaws.com/admin'
+
+  AdminUserPoolId:
+    Condition: AccessEnabled
+    Description: Cognito user pool for admin logins (invite-only).
+    Value: !Ref McUserPool
 
   PanelSecret:
     Description: >-
