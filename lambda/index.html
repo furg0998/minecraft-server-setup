@@ -1,0 +1,194 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Minecraft Server Control</title>
+<style>
+  :root {
+    --bg: #1b1f24; --panel: #262c33; --panel2: #2f3841; --text: #e8eef2;
+    --muted: #9aa7b1; --green: #57d06a; --red: #e0574f; --amber: #e8b93e;
+    --accent: #3ba55d;
+  }
+  * { box-sizing: border-box; }
+  body {
+    margin: 0; font-family: system-ui, -apple-system, "Segoe UI", sans-serif;
+    background: var(--bg); color: var(--text);
+    display: flex; flex-direction: column; align-items: center; padding: 24px 16px 48px;
+  }
+  main { width: 100%; max-width: 560px; }
+  h1 { font-size: 1.5rem; margin: 0 0 4px; }
+  h1 .creeper { color: var(--green); }
+  .sub { color: var(--muted); font-size: .85rem; margin-bottom: 20px; }
+  .card {
+    background: var(--panel); border-radius: 10px; padding: 18px;
+    margin-bottom: 14px; box-shadow: 0 2px 8px rgba(0,0,0,.35);
+  }
+  .badge {
+    display: inline-block; padding: 4px 14px; border-radius: 999px;
+    font-weight: 700; font-size: .85rem; letter-spacing: .04em;
+  }
+  .b-STOPPED  { background: #4a2020; color: #ff8a80; }
+  .b-ONLINE   { background: #16351c; color: var(--green); }
+  .b-STARTING { background: #3d3416; color: var(--amber); }
+  .b-STOPPING { background: #3d3416; color: var(--amber); }
+  .row { display: flex; justify-content: space-between; align-items: center; gap: 10px; flex-wrap: wrap; }
+  .big-status { display:flex; align-items:center; gap:14px; }
+  .big-status .badge { font-size: 1rem; padding: 8px 20px; }
+  button {
+    border: 0; border-radius: 8px; padding: 12px 26px; font-size: 1rem;
+    font-weight: 700; cursor: pointer; color: #fff; transition: filter .15s;
+  }
+  button:hover { filter: brightness(1.15); }
+  button:disabled { opacity: .45; cursor: not-allowed; }
+  .btn-start { background: var(--accent); }
+  .btn-stop  { background: #b03a32; }
+  .addr {
+    font-family: ui-monospace, Consolas, monospace; font-size: 1.15rem;
+    background: var(--panel2); padding: 10px 14px; border-radius: 8px;
+    display: inline-block; margin: 6px 0;
+  }
+  .copy { background: var(--panel2); color: var(--text); padding: 8px 14px; font-size: .85rem; }
+  .label { color: var(--muted); font-size: .8rem; text-transform: uppercase; letter-spacing: .06em; }
+  ul.players { list-style: none; padding: 0; margin: 8px 0 0; }
+  ul.players li { padding: 6px 0; border-bottom: 1px solid #3a434d; font-size: 1.05rem; }
+  ul.players li:last-child { border-bottom: 0; }
+  ol.steps { margin: 8px 0 0; padding-left: 20px; line-height: 1.7; }
+  #pwrow { display: flex; gap: 8px; margin-bottom: 16px; }
+  #pw {
+    flex: 1; padding: 12px; border-radius: 8px; border: 1px solid #3a434d;
+    background: var(--panel2); color: var(--text); font-size: 1rem;
+  }
+  #msg { min-height: 1.2em; font-size: .85rem; color: var(--amber); margin-top: 6px; }
+  .muted { color: var(--muted); }
+  code { background: var(--panel2); padding: 1px 6px; border-radius: 4px; }
+</style>
+</head>
+<body>
+<main>
+  <h1><span class="creeper">&#9729;</span> Minecraft Server</h1>
+  <div class="sub" id="serverName">Bedrock &middot; on-demand</div>
+
+  <div id="pwrow">
+    <input id="pw" type="password" placeholder="Panel password" autocomplete="current-password">
+    <button class="copy" id="savePw">Save</button>
+  </div>
+
+  <div class="card">
+    <div class="row big-status">
+      <span class="badge b-STOPPED" id="state">?</span>
+      <span>
+        <button class="btn-start" id="startBtn">Start</button>
+        <button class="btn-stop"  id="stopBtn">Stop</button>
+      </span>
+    </div>
+    <div id="msg"></div>
+  </div>
+
+  <div class="card" id="connectCard" hidden>
+    <div class="label">Server address</div>
+    <div class="row">
+      <span class="addr" id="addr">-</span>
+      <button class="copy" id="copyBtn">Copy</button>
+    </div>
+    <div class="muted" id="uptime"></div>
+  </div>
+
+  <div class="card">
+    <div class="label">Who's playing</div>
+    <ul class="players" id="players"><li class="muted">Nobody online</li></ul>
+  </div>
+
+  <div class="card">
+    <div class="label">How to join</div>
+    <ol class="steps">
+      <li>Press <b>Start</b> and wait about 1&ndash;2 minutes until the status shows <b>ONLINE</b>.</li>
+      <li>Open <b>Minecraft</b> (Bedrock edition) and tap <b>Play</b>.</li>
+      <li>Go to the <b>Servers</b> tab, scroll down, tap <b>Add Server</b>.</li>
+      <li>Enter any name, paste the <b>Server Address</b> shown above, keep port <code>19132</code>, tap <b>Save</b>.</li>
+      <li>Join the server. Your gamertag must be on the allow-list or you get &ldquo;not invited&rdquo;.</li>
+      <li>The address can change each time the server starts &mdash; check this page before joining.</li>
+      <li>When you're done, press <b>Stop</b> (or it stops by itself after everyone's been gone a while).</li>
+    </ol>
+  </div>
+</main>
+
+<script>
+const $ = id => document.getElementById(id);
+const pwInput = $("pw");
+pwInput.value = localStorage.getItem("mcPw") || "";
+$("savePw").onclick = () => {
+  localStorage.setItem("mcPw", pwInput.value);
+  refresh();
+};
+
+async function api(path, opts = {}) {
+  const res = await fetch(path, {
+    ...opts,
+    headers: { "x-panel-password": pwInput.value, "content-type": "application/json" }
+  });
+  if (res.status === 401) {
+    $("msg").textContent = "Wrong password - ask a parent.";
+    throw new Error("unauthorized");
+  }
+  return res.json();
+}
+
+function render(s) {
+  const badge = $("state");
+  badge.textContent = s.state;
+  badge.className = "badge b-" + s.state;
+  $("serverName").textContent = s.serverName + " \u00b7 Bedrock \u00b7 on-demand";
+
+  $("startBtn").disabled = s.state === "ONLINE" || s.state === "STARTING";
+  $("stopBtn").disabled  = s.state === "STOPPED" || s.state === "STOPPING";
+
+  const cc = $("connectCard");
+  if (s.address) {
+    cc.hidden = false;
+    $("addr").textContent = s.address + ":" + s.port;
+    $("uptime").textContent =
+      (s.state === "ONLINE" ? "Online" : "Starting") +
+      (s.uptimeMinutes != null ? " \u00b7 up " + s.uptimeMinutes + " min" : "") +
+      " \u00b7 auto-stops after " + s.idleShutdownMinutes + " min empty";
+  } else {
+    cc.hidden = true;
+  }
+
+  const ul = $("players");
+  ul.innerHTML = "";
+  if (s.players && s.players.length) {
+    for (const p of s.players) {
+      const li = document.createElement("li");
+      li.textContent = "\u{1F7E2} " + p;
+      ul.appendChild(li);
+    }
+  } else {
+    const li = document.createElement("li");
+    li.className = "muted";
+    li.textContent = s.state === "ONLINE" ? "Nobody online" : "Server is off";
+    ul.appendChild(li);
+  }
+}
+
+async function refresh() {
+  try { render(await api("/api/status")); }
+  catch (e) { if (e.message !== "unauthorized") $("msg").textContent = "Can't reach the server API."; }
+}
+
+async function control(action) {
+  $("msg").textContent = action === "start" ? "Starting\u2026 (takes ~1-2 min)" : "Stopping\u2026";
+  try { await api("/api/control", { method: "POST", body: JSON.stringify({ action }) }); }
+  catch (e) {}
+  setTimeout(refresh, 3000);
+}
+
+$("startBtn").onclick = () => control("start");
+$("stopBtn").onclick  = () => control("stop");
+$("copyBtn").onclick  = () => navigator.clipboard.writeText($("addr").textContent);
+
+refresh();
+setInterval(refresh, 10000);
+</script>
+</body>
+</html>

@@ -1,0 +1,582 @@
+AWSTemplateFormatVersion: '2010-09-09'
+Description: >-
+  On-demand Minecraft Bedrock Dedicated Server. Runs itzg/minecraft-bedrock-server
+  as an ECS Fargate task (desired count 0 or 1) with world data persisted on EFS.
+  A single API Gateway -> Lambda endpoint serves a static single-page control panel
+  plus a JSON API to start/stop the server and show status, including who is
+  currently connected (parsed from the task's CloudWatch logs). The panel and API
+  are protected by a shared password stored in Secrets Manager; in-game access is
+  controlled by the Bedrock allow-list (gamertags/XUIDs). An optional EventBridge
+  schedule auto-stops the server after an idle period with zero players online.
+
+Metadata:
+  AWSToolsMetrics:
+    AWSAgentToolkit: aws-cloudformation@3
+
+Parameters:
+
+  ServerName:
+    Type: String
+    Default: Family Minecraft Server
+    AllowedPattern: '^[\x20-\x7E]{1,64}$'
+    Description: Name shown to players in the Minecraft server list.
+
+  AllowedPlayers:
+    Type: String
+    Default: ''
+    Description: >-
+      Comma-separated players allowed to join the world (Bedrock allow-list).
+      Best format is gamertag:XUID, e.g. "Steve:2533274790567123,Alex:2535412345678901".
+      Plain gamertags also work but are less reliable. If empty, the allow-list
+      stays enabled and NOBODY can join until you add players. Look up XUIDs at
+      https://www.cxkes.me/xbox/xuid or read them from the server logs.
+
+  PanelPassword:
+    Type: String
+    NoEcho: true
+    Default: ''
+    AllowedPattern: '^([A-Za-z0-9!#$%^&*+=?._-]{6,64})?$'
+    Description: >-
+      Password for the web control panel and API. Leave blank to have one
+      generated in Secrets Manager (retrieve it from the secret shown in the
+      stack outputs).
+
+  GameMode:
+    Type: String
+    Default: survival
+    AllowedValues: [survival, creative, adventure]
+
+  Difficulty:
+    Type: String
+    Default: normal
+    AllowedValues: [peaceful, easy, normal, hard]
+
+  MaxPlayers:
+    Type: Number
+    Default: 10
+    MinValue: 2
+    MaxValue: 16
+    ConstraintDescription: >-
+      Capped at 16 because the fixed UDP gameplay range (19140-19155) provides
+      one port per player.
+
+  LevelSeed:
+    Type: String
+    Default: ''
+    Description: Optional world seed, applied only when a brand-new world is created.
+
+  Timezone:
+    Type: String
+    Default: UTC
+    Description: Container timezone used for server log timestamps (e.g. America/Chicago).
+
+  TaskCpu:
+    Type: String
+    Default: '1024'
+    AllowedValues: ['512', '1024', '2048']
+    Description: Fargate vCPU millicores for the server task.
+
+  TaskMemory:
+    Type: String
+    Default: '2048'
+    AllowedValues: ['1024', '2048', '4096', '8192', '16384']
+    ConstraintDescription: >-
+      Must be a valid Fargate pairing with TaskCpu (512->1-4GB, 1024->2-8GB,
+      2048->4-16GB).
+
+  ServerImage:
+    Type: String
+    Default: itzg/minecraft-bedrock-server:latest
+    Description: Container image for the Bedrock server. Pin a tag for stability.
+
+  AllowedClientCidr:
+    Type: String
+    Default: 0.0.0.0/0
+    AllowedPattern: '^\d{1,3}\.\d{1,3}\.\d{1,3}\.\d{1,3}/\d{1,2}$'
+    Description: >-
+      CIDR allowed to reach the game ports. Keep 0.0.0.0/0 so the kids can play
+      from anywhere; set to your home IP/32 to lock it down further.
+
+  EnableAutoStop:
+    Type: String
+    Default: 'true'
+    AllowedValues: ['true', 'false']
+    Description: Automatically stop the server when it has been empty too long.
+
+  IdleShutdownMinutes:
+    Type: Number
+    Default: 45
+    MinValue: 20
+    MaxValue: 720
+    Description: Minutes with zero players online before auto-stop kicks in.
+
+  AutoStopCheckInterval:
+    Type: Number
+    Default: 15
+    MinValue: 5
+    MaxValue: 60
+    Description: How often (minutes) the auto-stop check runs.
+
+Conditions:
+  HasPanelPassword: !Not [!Equals [!Ref PanelPassword, '']]
+  AutoStopEnabled: !Equals [!Ref EnableAutoStop, 'true']
+  HasSeed: !Not [!Equals [!Ref LevelSeed, '']]
+
+Resources:
+
+  # ------------------------------------------------------------------ network
+  McVpc:
+    Type: AWS::EC2::VPC
+    Metadata:
+      com.aws.cloudformation.Context:
+        why: >-
+          Two public subnets only - the task gets a public IP and talks directly
+          to the internet, avoiding a ~$32/month NAT gateway.
+    Properties:
+      CidrBlock: 10.42.0.0/16
+      EnableDnsSupport: true
+      EnableDnsHostnames: true
+      Tags: [{Key: Name, Value: !Sub '${AWS::StackName}-vpc'}]
+
+  McIgw:
+    Type: AWS::EC2::InternetGateway
+
+  VpcGatewayAttachment:
+    Type: AWS::EC2::VPCGatewayAttachment
+    Properties:
+      VpcId: !Ref McVpc
+      InternetGatewayId: !Ref McIgw
+
+  PublicSubnetA:
+    Type: AWS::EC2::Subnet
+    Properties:
+      VpcId: !Ref McVpc
+      CidrBlock: 10.42.1.0/24
+      AvailabilityZone: !Select [0, !GetAZs '']
+      MapPublicIpOnLaunch: true
+      Tags: [{Key: Name, Value: !Sub '${AWS::StackName}-public-a'}]
+
+  PublicSubnetB:
+    Type: AWS::EC2::Subnet
+    Properties:
+      VpcId: !Ref McVpc
+      CidrBlock: 10.42.2.0/24
+      AvailabilityZone: !Select [1, !GetAZs '']
+      MapPublicIpOnLaunch: true
+      Tags: [{Key: Name, Value: !Sub '${AWS::StackName}-public-b'}]
+
+  PublicRouteTable:
+    Type: AWS::EC2::RouteTable
+    Properties:
+      VpcId: !Ref McVpc
+
+  PublicRoute:
+    Type: AWS::EC2::Route
+    DependsOn: VpcGatewayAttachment
+    Properties:
+      RouteTableId: !Ref PublicRouteTable
+      DestinationCidrBlock: 0.0.0.0/0
+      GatewayId: !Ref McIgw
+
+  SubnetARouteTableAssoc:
+    Type: AWS::EC2::SubnetRouteTableAssociation
+    Properties:
+      SubnetId: !Ref PublicSubnetA
+      RouteTableId: !Ref PublicRouteTable
+
+  SubnetBRouteTableAssoc:
+    Type: AWS::EC2::SubnetRouteTableAssociation
+    Properties:
+      SubnetId: !Ref PublicSubnetB
+      RouteTableId: !Ref PublicRouteTable
+
+  # ---------------------------------------------------------- security groups
+  TaskSecurityGroup:
+    Type: AWS::EC2::SecurityGroup
+    Metadata:
+      com.aws.cloudformation.Context:
+        why: >-
+          Game ports are intentionally world-reachable (parameterizable): Bedrock
+          clients connect from arbitrary networks. In-game access is enforced by
+          the BDS allow-list plus Xbox Live authentication (ONLINE_MODE=true), not
+          by network ACLs.
+        must: >-
+          Only TCP 19132 (NetherNet signaling) and UDP 19140-19155 (one gameplay
+          port per player) are open; there is no SSH or admin port.
+    Properties:
+      GroupDescription: !Sub '${AWS::StackName} Minecraft task'
+      VpcId: !Ref McVpc
+      SecurityGroupIngress:
+        - IpProtocol: tcp
+          FromPort: 19132
+          ToPort: 19132
+          CidrIp: !Ref AllowedClientCidr
+          Description: Bedrock NetherNet signaling
+        - IpProtocol: udp
+          FromPort: 19140
+          ToPort: 19155
+          CidrIp: !Ref AllowedClientCidr
+          Description: Bedrock NetherNet gameplay ports
+      SecurityGroupEgress:
+        - IpProtocol: -1
+          CidrIp: 0.0.0.0/0
+          Description: Image pull, Mojang server download, Xbox Live auth, EFS
+      Tags: [{Key: Name, Value: !Sub '${AWS::StackName}-task-sg'}]
+
+  EfsSecurityGroup:
+    Type: AWS::EC2::SecurityGroup
+    Properties:
+      GroupDescription: !Sub '${AWS::StackName} EFS mount targets'
+      VpcId: !Ref McVpc
+      SecurityGroupIngress:
+        - IpProtocol: tcp
+          FromPort: 2049
+          ToPort: 2049
+          SourceSecurityGroupId: !Ref TaskSecurityGroup
+          Description: NFS from the Minecraft task only
+
+  # ------------------------------------------------------------------ storage
+  WorldFileSystem:
+    Type: AWS::EFS::FileSystem
+    Metadata:
+      com.aws.cloudformation.Context:
+        why: >-
+          Holds /data - the downloaded BDS binaries plus the world, player and
+          config files - so state survives the task being stopped between sessions.
+        must: >-
+          Retain policies prevent CloudFormation deletes or replacement updates
+          from destroying the kids' world. Delete manually if ever truly unwanted.
+    DeletionPolicy: Retain
+    UpdateReplacePolicy: Retain
+    Properties:
+      Encrypted: true
+      PerformanceMode: generalPurpose
+      ThroughputMode: bursting
+      FileSystemTags: [{Key: Name, Value: !Sub '${AWS::StackName}-world'}]
+
+  MountTargetA:
+    Type: AWS::EFS::MountTarget
+    Properties:
+      FileSystemId: !Ref WorldFileSystem
+      SubnetId: !Ref PublicSubnetA
+      SecurityGroups: [!Ref EfsSecurityGroup]
+
+  MountTargetB:
+    Type: AWS::EFS::MountTarget
+    Properties:
+      FileSystemId: !Ref WorldFileSystem
+      SubnetId: !Ref PublicSubnetB
+      SecurityGroups: [!Ref EfsSecurityGroup]
+
+  WorldAccessPoint:
+    Type: AWS::EFS::AccessPoint
+    Metadata:
+      com.aws.cloudformation.Context:
+        why: >-
+          Pins ownership of /data to uid/gid 1000 (the itzg image derives its run
+          user from the /data owner) regardless of how the container runs.
+    Properties:
+      FileSystemId: !Ref WorldFileSystem
+      PosixUser: {Uid: '1000', Gid: '1000'}
+      RootDirectory:
+        Path: /minecraft
+        CreationInfo: {OwnerUid: '1000', OwnerGid: '1000', Permissions: '0755'}
+
+  # ------------------------------------------------------------- ecs + server
+  McCluster:
+    Type: AWS::ECS::Cluster
+
+  ServerLogGroup:
+    Type: AWS::Logs::LogGroup
+    Metadata:
+      com.aws.cloudformation.Context:
+        why: >-
+          Source of truth for "who is online" - the control Lambda parses
+          Player connected/disconnected lines from the current task's stream.
+    Properties:
+      LogGroupName: !Sub '/ecs/${AWS::StackName}'
+      RetentionInDays: 14
+
+  TaskExecutionRole:
+    Type: AWS::IAM::Role
+    Properties:
+      AssumeRolePolicyDocument:
+        Statement:
+          - Effect: Allow
+            Principal: {Service: ecs-tasks.amazonaws.com}
+            Action: sts:AssumeRole
+      ManagedPolicyArns:
+        - arn:aws:iam::aws:policy/service-role/AmazonECSTaskExecutionRolePolicy
+
+  TaskRole:
+    Type: AWS::IAM::Role
+    Properties:
+      AssumeRolePolicyDocument:
+        Statement:
+          - Effect: Allow
+            Principal: {Service: ecs-tasks.amazonaws.com}
+            Action: sts:AssumeRole
+
+  ServerTaskDefinition:
+    Type: AWS::ECS::TaskDefinition
+    Metadata:
+      com.aws.cloudformation.Context:
+        why: >-
+          NetherNet transport (BDS >= 1.26.50) needs TCP 19132 for the signaling
+          handshake plus one UDP port per connected player; SERVER_UDP_PORTS is
+          given the <public_ipv4> placeholder so the entrypoint advertises the
+          task's public IP at startup. ALLOW_LIST stays on: it is the access
+          control Bedrock has (there is no server password in BDS).
+        must: >-
+          World data must stay on the EFS access point at /data and EULA must
+          remain TRUE for the image to boot.
+    Properties:
+      Family: !Sub '${AWS::StackName}-server'
+      RequiresCompatibilities: [FARGATE]
+      NetworkMode: awsvpc
+      Cpu: !Ref TaskCpu
+      Memory: !Ref TaskMemory
+      ExecutionRoleArn: !GetAtt TaskExecutionRole.Arn
+      TaskRoleArn: !GetAtt TaskRole.Arn
+      Volumes:
+        - Name: mcdata
+          EFSVolumeConfiguration:
+            FilesystemId: !Ref WorldFileSystem
+            TransitEncryption: ENABLED
+            AuthorizationConfig:
+              AccessPointId: !Ref WorldAccessPoint
+      ContainerDefinitions:
+        - Name: minecraft
+          Image: !Ref ServerImage
+          Essential: true
+          StopTimeout: 120
+          PortMappings:
+            - ContainerPort: 19132
+              Protocol: tcp
+              HostPort: 19132
+            - ContainerPortRange: '19140-19155'
+              Protocol: udp
+          MountPoints:
+            - SourceVolume: mcdata
+              ContainerPath: /data
+          Environment:
+            - {Name: EULA, Value: 'TRUE'}
+            - {Name: TZ, Value: !Ref Timezone}
+            - {Name: SERVER_NAME, Value: !Ref ServerName}
+            - {Name: GAMEMODE, Value: !Ref GameMode}
+            - {Name: DIFFICULTY, Value: !Ref Difficulty}
+            - {Name: MAX_PLAYERS, Value: !Sub '${MaxPlayers}'}
+            - {Name: ONLINE_MODE, Value: 'true'}
+            - {Name: ALLOW_LIST, Value: 'true'}
+            - {Name: ALLOW_LIST_USERS, Value: !Ref AllowedPlayers}
+            - {Name: SERVER_PORT, Value: '19132'}
+            - {Name: SERVER_UDP_PORTS, Value: '<public_ipv4>:19140-19155:19140-19155'}
+            - !If
+              - HasSeed
+              - {Name: SEED, Value: !Ref LevelSeed}
+              - !Ref AWS::NoValue
+          LogConfiguration:
+            LogDriver: awslogs
+            Options:
+              awslogs-group: !Ref ServerLogGroup
+              awslogs-region: !Ref AWS::Region
+              awslogs-stream-prefix: minecraft
+
+  McService:
+    Type: AWS::ECS::Service
+    DependsOn: [MountTargetA, MountTargetB]
+    Metadata:
+      com.aws.cloudformation.Context:
+        why: >-
+          DesiredCount lives at 0 so the server costs nothing when off; the
+          control Lambda flips it to 1 on demand and back to 0 on stop/auto-stop.
+        must: >-
+          DesiredCount in this template stays 0 - any stack update will therefore
+          stop a running server, which is the safe failure direction.
+    Properties:
+      Cluster: !Ref McCluster
+      TaskDefinition: !Ref ServerTaskDefinition
+      DesiredCount: 0
+      LaunchType: FARGATE
+      PlatformVersion: LATEST
+      NetworkConfiguration:
+        AwsvpcConfiguration:
+          AssignPublicIp: ENABLED
+          SecurityGroups: [!Ref TaskSecurityGroup]
+          Subnets: [!Ref PublicSubnetA, !Ref PublicSubnetB]
+
+  # ------------------------------------------------------------- panel secret
+  PanelSecret:
+    Type: AWS::SecretsManager::Secret
+    Metadata:
+      com.aws.cloudformation.Context:
+        why: >-
+          Shared password for the control panel/API. If the PanelPassword
+          parameter is blank a random one is generated; the Lambda reads the
+          current value at cold start so rotation/manual edits take effect on the
+          next invocation.
+    Properties:
+      Description: !Sub '${AWS::StackName} control panel password'
+      SecretString: !If
+        - HasPanelPassword
+        - !Sub '{"password": "${PanelPassword}"}'
+        - !Ref AWS::NoValue
+      GenerateSecretString: !If
+        - HasPanelPassword
+        - !Ref AWS::NoValue
+        - SecretStringTemplate: '{"username": "panel"}'
+          GenerateStringKey: password
+          PasswordLength: 20
+          ExcludePunctuation: true
+
+  # ----------------------------------------------------------- control lambda
+  ControlLambdaRole:
+    Type: AWS::IAM::Role
+    Properties:
+      AssumeRolePolicyDocument:
+        Statement:
+          - Effect: Allow
+            Principal: {Service: lambda.amazonaws.com}
+            Action: sts:AssumeRole
+      ManagedPolicyArns:
+        - arn:aws:iam::aws:policy/service-role/AWSLambdaBasicExecutionRole
+      Policies:
+        - PolicyName: minecraft-control
+          PolicyDocument:
+            Statement:
+              - Sid: EcsReadAndScale
+                Effect: Allow
+                Action:
+                  - ecs:DescribeServices
+                  - ecs:UpdateService
+                  - ecs:ListTasks
+                  - ecs:DescribeTasks
+                Resource:
+                  - !GetAtt McCluster.Arn
+                  - !Sub 'arn:aws:ecs:${AWS::Region}:${AWS::AccountId}:service/${McCluster}/*'
+                  - !Sub 'arn:aws:ecs:${AWS::Region}:${AWS::AccountId}:task/${McCluster}/*'
+              - Sid: EniLookup
+                Effect: Allow
+                Action: ec2:DescribeNetworkInterfaces
+                Resource: '*'
+              - Sid: ReadServerLogs
+                Effect: Allow
+                Action:
+                  - logs:FilterLogEvents
+                  - logs:DescribeLogStreams
+                Resource:
+                  - !Sub 'arn:aws:logs:${AWS::Region}:${AWS::AccountId}:log-group:${ServerLogGroup}'
+                  - !Sub 'arn:aws:logs:${AWS::Region}:${AWS::AccountId}:log-group:${ServerLogGroup}:*'
+              - Sid: ReadPanelPassword
+                Effect: Allow
+                Action: secretsmanager:GetSecretValue
+                Resource: !Ref PanelSecret
+
+  ControlLambda:
+    Type: AWS::Lambda::Function
+    Metadata:
+      com.aws.cloudformation.Context:
+        why: >-
+          Single function serves the SPA (GET /), the JSON API (status/start/stop)
+          and the scheduled auto-stop check, keeping one free execute-api URL.
+        must: Code path is packaged by `aws cloudformation package` (see deploy.ps1).
+    Properties:
+      FunctionName: !Sub '${AWS::StackName}-control'
+      Role: !GetAtt ControlLambdaRole.Arn
+      Runtime: python3.13
+      Handler: handler.lambda_handler
+      Code: lambda/
+      Timeout: 30
+      MemorySize: 256
+      Environment:
+        Variables:
+          CLUSTER_NAME: !Ref McCluster
+          SERVICE_NAME: !Ref McService
+          LOG_GROUP_NAME: !Ref ServerLogGroup
+          PANEL_SECRET_ARN: !Ref PanelSecret
+          IDLE_SHUTDOWN_MINUTES: !Ref IdleShutdownMinutes
+          GAME_PORT: '19132'
+          SERVER_NAME: !Ref ServerName
+
+  # -------------------------------------------------------------- http facade
+  PanelApi:
+    Type: AWS::ApiGatewayV2::Api
+    Properties:
+      Name: !Sub '${AWS::StackName}-api'
+      ProtocolType: HTTP
+
+  ApiLambdaIntegration:
+    Type: AWS::ApiGatewayV2::Integration
+    Properties:
+      ApiId: !Ref PanelApi
+      IntegrationType: AWS_PROXY
+      IntegrationUri: !GetAtt ControlLambda.Arn
+      PayloadFormatVersion: '2.0'
+      TimeoutInMillis: 29000
+
+  ApiDefaultRoute:
+    Type: AWS::ApiGatewayV2::Route
+    Properties:
+      ApiId: !Ref PanelApi
+      RouteKey: $default
+      Target: !Sub 'integrations/${ApiLambdaIntegration}'
+
+  ApiDefaultStage:
+    Type: AWS::ApiGatewayV2::Stage
+    Properties:
+      ApiId: !Ref PanelApi
+      StageName: $default
+      AutoDeploy: true
+
+  ApiInvokePermission:
+    Type: AWS::Lambda::Permission
+    Properties:
+      FunctionName: !Ref ControlLambda
+      Action: lambda:InvokeFunction
+      Principal: apigateway.amazonaws.com
+      SourceArn: !Sub 'arn:aws:execute-api:${AWS::Region}:${AWS::AccountId}:${PanelApi}/*'
+
+  # ---------------------------------------------------------------- auto-stop
+  AutoStopRule:
+    Type: AWS::Events::Rule
+    Condition: AutoStopEnabled
+    Properties:
+      Description: Stop the Minecraft server after it has been empty for a while
+      ScheduleExpression: !Sub 'rate(${AutoStopCheckInterval} minutes)'
+      State: ENABLED
+      Targets:
+        - Arn: !GetAtt ControlLambda.Arn
+          Id: autostop
+
+  AutoStopInvokePermission:
+    Type: AWS::Lambda::Permission
+    Condition: AutoStopEnabled
+    Properties:
+      FunctionName: !Ref ControlLambda
+      Action: lambda:InvokeFunction
+      Principal: events.amazonaws.com
+      SourceArn: !GetAtt AutoStopRule.Arn
+
+Outputs:
+  PanelUrl:
+    Description: >-
+      Control panel URL - bookmark this. Start/stop the server and see who is
+      playing here.
+    Value: !Sub 'https://${PanelApi}.execute-api.${AWS::Region}.amazonaws.com'
+
+  PanelSecret:
+    Description: >-
+      Secrets Manager secret holding the panel password. If PanelPassword was
+      left blank, retrieve the generated one with:
+      aws secretsmanager get-secret-value --secret-id <this ARN>
+    Value: !Ref PanelSecret
+
+  WorldFileSystem:
+    Description: EFS file system holding the persistent world data (retained on stack delete).
+    Value: !Ref WorldFileSystem
+
+  ClusterName:
+    Value: !Ref McCluster
+
+  ServiceName:
+    Value: !Ref McService
