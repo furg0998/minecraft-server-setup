@@ -30,6 +30,20 @@ param(
 $ErrorActionPreference = 'Stop'
 Set-Location $PSScriptRoot
 
+# Optional local config (gitignored): deploy.local.json holds default values for
+# any parameter above, e.g. {"AllowedPlayers": "tag:xuid", "PanelPassword": "pw"}.
+# Explicit command-line arguments always win over the file.
+$configFile = Join-Path $PSScriptRoot 'deploy.local.json'
+if (Test-Path $configFile) {
+  $cfg = Get-Content $configFile -Raw | ConvertFrom-Json
+  foreach ($name in $cfg.PSObject.Properties.Name) {
+    if (-not $PSBoundParameters.ContainsKey($name) -and
+        (Get-Variable -Name $name -Scope Script -ErrorAction SilentlyContinue)) {
+      Set-Variable -Name $name -Value $cfg.$name
+    }
+  }
+}
+
 if (-not $Region) {
   try { $Region = aws configure get region 2>$null } catch { $Region = '' }
 }

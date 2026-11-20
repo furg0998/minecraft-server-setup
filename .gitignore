@@ -1,3 +1,4 @@
 __pycache__/
 *.pyc
 .packaged.yaml
+deploy.local.json

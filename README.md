@@ -21,9 +21,11 @@ current address, and see who is playing.
                           │   (stops server if empty > IdleShutdown)    │
                           │                                             │
                           │ ECS Fargate task (only runs when desired=1) │
-                          │   itzg/minecraft-bedrock-server             │
-                          │   TCP 19132 (NetherNet signaling)           │
-                          │   UDP 19140-19155 (one per player)          │
+                          │   ├─ itzg/minecraft-bedrock-server          │
+                          │   │   TCP 19132 (NetherNet signaling)       │
+                          │   │   UDP 19140-19155 (one per player)      │
+                          │   ├─ map-render (uNmINeD, every 10 min)     │
+                          │   └─ map-web (nginx) → http://<ip>/ on :80  │
                           │        │                                    │
                           │        ▼                                    │
                           │ EFS (retained): /data = binaries + world    │
@@ -51,8 +53,40 @@ The script creates an artifacts bucket, runs `aws cloudformation package`, then
 that URL and the panel password to the kids.
 
 Other `deploy.ps1` parameters: `-ServerName`, `-GameMode`, `-Difficulty`,
-`-MaxPlayers`, `-EnableAutoStop`, `-IdleShutdownMinutes`, `-Region`,
-`-StackName`.
+`-MaxPlayers`, `-EnableAutoStop`, `-IdleShutdownMinutes`, `-EnableAllowList`,
+`-EnableMap`, `-Region`, `-StackName`.
+
+**Every `deploy.ps1` run must re-pass all parameters you care about** —
+anything not passed resets to its template default. To make this easy, put your
+values in `deploy.local.json` (gitignored — it stays on your machine and is
+never committed):
+
+```json
+{
+  "AllowedPlayers": "furgle7287:2535418409774460",
+  "PanelPassword": "pokemon",
+  "EnableAllowList": "true",
+  "EnableMap": "true"
+}
+```
+
+The script uses the file as defaults; explicit command-line parameters still
+win for one-off overrides.
+
+## World map
+
+While the server is running, a uNmINeD-rendered interactive map of the world is
+served by an nginx sidecar at `http://<server-ip>/` (port 80). The panel shows
+an "Open world map" button when it's available.
+
+- The renderer sidecar snapshots `worlds/` from EFS and re-renders every 10
+  minutes (`MAP_INTERVAL_SECONDS` in the task definition).
+- Tiles persist on the EFS `/map` access point, so re-renders are incremental.
+- First render takes a few minutes after startup (uNmINeD CLI is downloaded to
+  `/data/.tools` on first boot, then cached).
+- The map is only reachable while the server is running — same public IP.
+- Disable with `-EnableMap false` if you want the task's CPU/memory purely for
+  the game (rendering is `nice`'d, but still shares the task).
 
 ## Important: access control is the allow-list, not a password
 
@@ -71,6 +105,10 @@ For the most reliable allow-listing use `gamertag:XUID` pairs:
 
 To change allowed players later, redeploy with the new `-AllowedPlayers` list
 (stack update). Then stop+start the server so the new task picks it up.
+
+To disable the allow-list entirely (anyone with the IP can join), redeploy with
+`-EnableAllowList false`. Prefer keeping it on — the allow-list is the only
+per-player access control Bedrock has.
 
 ## Notes / limitations
 

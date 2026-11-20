@@ -36,15 +36,18 @@ logs = boto3.client("logs", region_name=REGION)
 secrets = boto3.client("secretsmanager", region_name=REGION)
 
 _password = None
+_password_fetched_at = 0.0
+_PASSWORD_TTL = 300  # re-read the secret every 5 min so rotations propagate
 _html = Path(__file__).with_name("index.html").read_text(encoding="utf-8")
 _PLAYER_RE = re.compile(r"Player (connected|disconnected):\s*([^,]+)")
 
 
 def _panel_password():
-    global _password
-    if _password is None:
+    global _password, _password_fetched_at
+    if _password is None or time.time() - _password_fetched_at > _PASSWORD_TTL:
         secret = secrets.get_secret_value(SecretId=SECRET_ARN)["SecretString"]
         _password = json.loads(secret)["password"]
+        _password_fetched_at = time.time()
     return _password
 
 
