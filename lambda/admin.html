@@ -112,7 +112,7 @@ async function login() {
   sessionStorage.setItem("admVerifier", verifier);
   const url = COGNITO_DOMAIN + "/oauth2/authorize?" + new URLSearchParams({
     response_type: "code", client_id: CLIENT_ID, redirect_uri: REDIRECT_URI,
-    scope: "openid email profile",
+    scope: "openid email profile aws.cognito.signin.user.admin",
     code_challenge: challenge, code_challenge_method: "S256",
   });
   location.href = url;

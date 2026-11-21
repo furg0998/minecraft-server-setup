@@ -112,12 +112,29 @@ def _admin_authed(event):
 
 
 def _access_store():
-    """Read {"players": "tag:xuid,...", "requests": [...]} from Secrets Manager."""
+    """Read the player-access secret: {players(param), approved(admin),
+    requests(pending), combined(what ECS injects)}."""
     raw = secrets.get_secret_value(SecretId=PLAYER_ACCESS_ARN)["SecretString"]
     data = json.loads(raw or "{}")
     data.setdefault("players", "")
+    data.setdefault("approved", [])
     data.setdefault("requests", [])
+    data.setdefault("combined", data["players"])
     return data
+
+
+def _combined(data):
+    """Recompute the merged allow-list: param players + admin approved."""
+    seen, combined = set(), []
+    for p in (data.get("players") or "").split(",") + (data.get("approved") or []):
+        p = p.strip()
+        if not p:
+            continue
+        key = p.rsplit(":", 1)[-1] if ":" in p else p.lower()
+        if key not in seen:
+            seen.add(key)
+            combined.append(p)
+    return combined
 
 
 def _save_access_store(data):
@@ -141,7 +158,7 @@ def _lookup_xuid(gamertag):
 
 
 def _players_list(data):
-    return [p for p in (data.get("players") or "").split(",") if p.strip()]
+    return [p for p in (data.get("combined") or "").split(",") if p]
 
 
 def _request_access(gamertag):
@@ -155,7 +172,6 @@ def _request_access(gamertag):
         return _resp(404, {"error": "gamertag not found - check spelling"})
 
     data = _access_store()
-    entry = f"{found['gamertag']}:{found['xuid']}"
     if any(p.split(":")[-1] == found["xuid"] or
            p.split(":")[0].lower() == found["gamertag"].lower()
            for p in _players_list(data)):
@@ -165,8 +181,7 @@ def _request_access(gamertag):
                         and r.get("gamertag", "").lower() != found["gamertag"].lower()]
     data["requests"].append({**found, "ts": int(time.time())})
     _save_access_store(data)
-    return _resp(200, {"ok": True, "alreadyAllowed": False,
-                       "entry": entry, **found})
+    return _resp(200, {"ok": True, "alreadyAllowed": False, **found})
 
 
 def _admin_approve(body):
@@ -175,11 +190,12 @@ def _admin_approve(body):
     if not xuid or not gamertag:
         return _resp(400, {"error": "gamertag and xuid required"})
     data = _access_store()
-    players = _players_list(data)
-    if not any(p.split(":")[-1] == xuid for p in players):
-        players.append(f"{gamertag}:{xuid}")
-        data["players"] = ",".join(players)
+    approved = data["approved"]
+    if not any(p.split(":")[-1] == xuid for p in approved):
+        approved.append(f"{gamertag}:{xuid}")
+        data["approved"] = approved
     data["requests"] = [r for r in data["requests"] if r.get("xuid") != xuid]
+    data["combined"] = ",".join(_combined(data))
     _save_access_store(data)
 
     restarting = False

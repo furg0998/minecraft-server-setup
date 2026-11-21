@@ -414,6 +414,13 @@ Resources:
             Action: sts:AssumeRole
       ManagedPolicyArns:
         - arn:aws:iam::aws:policy/service-role/AmazonECSTaskExecutionRolePolicy
+      Policies:
+        - PolicyName: read-allowlist-secret
+          PolicyDocument:
+            Statement:
+              - Effect: Allow
+                Action: secretsmanager:GetSecretValue
+                Resource: !Ref PlayerAccessSecret
 
   TaskRole:
     Type: AWS::IAM::Role
@@ -505,7 +512,7 @@ Resources:
               - !Ref AWS::NoValue
           Secrets:
             - Name: ALLOW_LIST_USERS
-              ValueFrom: !Sub '${PlayerAccessSecret}:players::'
+              ValueFrom: !Sub '${PlayerAccessSecret}:combined::'
           LogConfiguration:
             LogDriver: awslogs
             Options:
@@ -581,7 +588,7 @@ Resources:
 
   McService:
     Type: AWS::ECS::Service
-    DependsOn: [MountTargetA, MountTargetB]
+    DependsOn: [MountTargetA, MountTargetB, MergeAllowList]
     Metadata:
       com.aws.cloudformation.Context:
         why: >-
@@ -639,7 +646,56 @@ Resources:
           which resets approved players/requests back to the parameter value.
     Properties:
       Description: !Sub '${AWS::StackName} allow-list + pending access requests'
-      SecretString: !Sub '{"players": "${AllowedPlayers}", "requests": []}'
+      # No SecretString on purpose: the MergeAllowList custom resource owns the
+      # value so stack updates can merge the AllowedPlayers parameter with
+      # admin-approved players instead of overwriting them.
+      # Keys: players (param), approved (admin), requests (pending), combined
+      # (what ECS injects into ALLOW_LIST_USERS).
+
+  MergeLambdaRole:
+    Type: AWS::IAM::Role
+    Properties:
+      AssumeRolePolicyDocument:
+        Statement:
+          - Effect: Allow
+            Principal: {Service: lambda.amazonaws.com}
+            Action: sts:AssumeRole
+      ManagedPolicyArns:
+        - arn:aws:iam::aws:policy/service-role/AWSLambdaBasicExecutionRole
+      Policies:
+        - PolicyName: merge-allowlist
+          PolicyDocument:
+            Statement:
+              - Effect: Allow
+                Action:
+                  - secretsmanager:GetSecretValue
+                  - secretsmanager:PutSecretValue
+                Resource: !Ref PlayerAccessSecret
+
+  MergeLambda:
+    Type: AWS::Lambda::Function
+    Metadata:
+      com.aws.cloudformation.Context:
+        why: >-
+          Backs the MergeAllowList custom resource so stack updates merge the
+          AllowedPlayers parameter with admin approvals rather than replacing
+          the secret value.
+        must: Code path is packaged by `aws cloudformation package` (see deploy.ps1).
+    Properties:
+      FunctionName: !Sub '${AWS::StackName}-allowlist-merge'
+      Role: !GetAtt MergeLambdaRole.Arn
+      Runtime: python3.13
+      Handler: merge.lambda_handler
+      Code: lambda/
+      Timeout: 30
+      MemorySize: 128
+
+  MergeAllowList:
+    Type: AWS::CloudFormation::CustomResource
+    Properties:
+      ServiceToken: !GetAtt MergeLambda.Arn
+      SecretArn: !Ref PlayerAccessSecret
+      Players: !Ref AllowedPlayers
 
   # ------------------------------------------------------------- cognito admin
   McUserPool:
@@ -680,7 +736,7 @@ Resources:
       GenerateSecret: false
       AllowedOAuthFlowsUserPoolClient: true
       AllowedOAuthFlows: [code]
-      AllowedOAuthScopes: [openid, email, profile]
+      AllowedOAuthScopes: [openid, email, profile, aws.cognito.signin.user.admin]
       SupportedIdentityProviders: [COGNITO]
       CallbackURLs:
         - !If
@@ -938,6 +994,14 @@ Resources:
             - P: !If [HasDnsPrefix, !Ref DnsPrefix, !Ref AWS::StackName]
               Z: !Ref HostedZoneName
           HostedZoneId: !Ref HostedZoneId
+        - !If
+          - AdminDomainEnabled
+          - DomainName: !Sub
+              - 'admin.${P}.${Z}'
+              - P: !If [HasDnsPrefix, !Ref DnsPrefix, !Ref AWS::StackName]
+                Z: !Ref HostedZoneName
+            HostedZoneId: !Ref HostedZoneId
+          - !Ref AWS::NoValue
 
   PanelDomain:
     Type: AWS::ApiGatewayV2::DomainName

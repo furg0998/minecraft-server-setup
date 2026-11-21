@@ -105,16 +105,26 @@ For the most reliable allow-listing use `gamertag:XUID` pairs:
 - Or check the server logs — a player's XUID is printed on join:
   `aws logs filter-log-events --log-group-name /ecs/minecraft-bedrock`
 
-The allow-list lives in a **Secrets Manager secret** (`player-access`, key
-`players`), injected into the container at task start. That means:
+The allow-list lives in a **Secrets Manager secret** (`player-access`), injected
+into the container at task start. It holds four keys:
 
-- Approving a player from the admin page updates the secret directly — no
-  CloudFormation deploy needed.
-- **Adding a player restarts the server task** (~1–2 min) if it's running —
-  `allowlist.json` is written at container start and can't be hot-reloaded.
-  If the server is stopped, the change just applies on next start.
-- A `deploy.ps1` run rewrites the secret from `-AllowedPlayers`, resetting any
-  admin approvals — keep the full list in `deploy.local.json`.
+| Key | Owner |
+|---|---|
+| `players` | the `-AllowedPlayers` deploy parameter (rewritten on each deploy) |
+| `approved` | the admin approval page (preserved across deploys) |
+| `requests` | pending access requests from the panel form |
+| `combined` | `players` + `approved` — what the container actually reads |
+
+A CloudFormation custom resource (`MergeAllowList`) merges them on each deploy,
+so **admin approvals survive redeploys**. Removing a player:
+
+- from `deploy.local.json`/`-AllowedPlayers` works normally;
+- admin-approved players must be removed via Secrets Manager (edit the
+  `approved` key) or the admin page.
+
+Approving a player updates the secret directly — no CloudFormation deploy
+needed — and **restarts the server task** (~1–2 min) if it's running, since
+`allowlist.json` is written at container start and can't be hot-reloaded.
 
 To disable the allow-list entirely (anyone with the IP can join), redeploy with
 `-EnableAllowList false`. Prefer keeping it on — the allow-list is the only
